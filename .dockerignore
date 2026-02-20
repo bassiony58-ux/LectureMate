@@ -1,0 +1,69 @@
+# Dependencies
+node_modules
+venv
+env
+ENV
+.venv
+
+# Build outputs
+dist
+build
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Firebase
+.firebase
+firebase-debug.log
+firestore-debug.log
+firebase-service-account.json
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.vscode
+.idea
+.cursor
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+**/__tests__/**
+**/*.test.*
+**/*.spec.*
+
+# Replit
+.replit
+.local
+
+# Attached assets (optional - include if needed)
+# attached_assets
+
+# Python cache
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Temporary files
+*.tmp
+*.temp
+*.tar.gz
+

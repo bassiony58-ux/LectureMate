@@ -1,0 +1,94 @@
+#!/bin/bash
+set -e
+
+echo "🚀 LectureMate (newlec) server setup"
+echo "==================================="
+
+# 1) Base packages
+apt-get update -y
+apt-get install -y curl wget git build-essential ffmpeg ca-certificates \
+  python3 python3-venv python3-pip pkg-config
+
+# 2) Node.js 20
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+
+echo "✅ Node: $(node -v)"
+echo "✅ Python: $(python3 --version)"
+
+# 3) NVIDIA CUDA repo (skip if already present)
+if ! grep -R "developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64" /etc/apt/sources.list* >/dev/null 2>&1; then
+  echo "➕ Adding NVIDIA CUDA repo..."
+  wget -qO /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+  dpkg -i /tmp/cuda-keyring.deb
+fi
+
+apt-get update -y
+
+# 4) GPU runtime libs needed (fixes libcudnn_graph + libcublas.so.12)
+# cuDNN9 for CUDA 11.8 line (as you used)
+apt-get install -y libcudnn9-cuda-11
+
+# CUDA 12 runtime libs used by faster-whisper/ctranslate2 builds
+apt-get install -y libcublas-12-4 libcusolver-12-4 libcurand-12-4 || true
+
+ldconfig
+
+# 5) Persistent dirs
+mkdir -p /workspace/.ollama /workspace/.cache/huggingface
+echo 'export OLLAMA_MODELS=/workspace/.ollama' >> ~/.bashrc
+echo 'export HF_HOME=/workspace/.cache/huggingface' >> ~/.bashrc
+
+export OLLAMA_MODELS=/workspace/.ollama
+export HF_HOME=/workspace/.cache/huggingface
+
+# 6) Clone or update repo
+cd /workspace
+if [ -d "newlec" ]; then
+  cd newlec && git pull origin main
+else
+  git clone https://github.com/MohamedAdelF/newlec.git
+  cd newlec
+fi
+
+# 7) Python venv + deps
+python3 -m venv venv
+source venv/bin/activate
+pip install -U pip wheel setuptools
+pip install -r requirements.txt
+# (لو faster-whisper مش في requirements)
+pip show faster-whisper >/dev/null 2>&1 || pip install faster-whisper
+
+# 8) Node deps + build
+npm install
+npm run build
+
+# 9) Create .env template (بدون secrets)
+if [ ! -f .env ]; then
+  cat > .env << 'ENVEOF'
+# AI Configuration
+GEMINI_API_KEY=
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:14b
+
+# GPU Configuration
+CUDA_VISIBLE_DEVICES=0
+PYTHON_CMD=python3
+
+# Server Configuration
+NODE_ENV=production
+PORT=5000
+
+# Storage
+OLLAMA_MODELS=/workspace/.ollama
+HF_HOME=/workspace/.cache/huggingface
+ENVEOF
+fi
+
+echo ""
+echo "✅ Setup complete"
+echo "Next steps:"
+echo "1) Edit /workspace/newlec/.env and put GEMINI_API_KEY (DO NOT commit it)."
+echo "2) Start server with: ./start.sh"

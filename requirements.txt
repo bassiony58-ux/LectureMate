@@ -1,0 +1,9 @@
+youtube-transcript-api>=0.6.0
+faster-whisper>=1.0.0
+yt-dlp>=2024.0.0
+numpy<2.0
+
+# For GPU detection and better performance
+# PyTorch must be installed separately with CUDA support:
+# pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+

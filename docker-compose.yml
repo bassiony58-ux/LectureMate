@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  lecture-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lecture-assistant:latest
+    container_name: lecture-assistant
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - PORT=5000
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTHON_CMD=python3
+      # Add your API keys here or use .env file
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_URL=${OLLAMA_URL:-http://localhost:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:32b}
+      # Firebase (if using service account file)
+      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS}
+    volumes:
+      # Mount service account key if needed
+      - ./firebase-service-account.json:/app/firebase-service-account.json:ro
+      # Optional: Mount uploads directory for persistence
+      - ./uploads:/tmp/lecture-assistant-uploads
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
