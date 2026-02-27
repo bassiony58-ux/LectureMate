@@ -5,7 +5,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { FileText, List, HelpCircle, Presentation, Share2, Download, ChevronLeft, Trash2, X, Sparkles, Clock, Calendar } from "lucide-react";
+import { FileText, List, HelpCircle, Presentation, Share2, Download, ChevronLeft, Trash2, X, Sparkles, Clock, Calendar, Sigma } from "lucide-react";
 import { motion } from "framer-motion";
 import { Link, useLocation } from "wouter";
 import { TranscriptView } from "@/components/lecture/TranscriptView";
@@ -13,10 +13,13 @@ import { SummaryView } from "@/components/lecture/SummaryView";
 import { QuizView } from "@/components/lecture/QuizView";
 import { SlidesView } from "@/components/lecture/SlidesView";
 import { FlashcardsView } from "@/components/lecture/FlashcardsView";
-import { ChatAssistant } from "@/components/lecture/ChatAssistant";
-import { Brain } from "lucide-react";
+import { FormulasView } from "@/components/lecture/FormulasView";
+import { MindMapView } from "@/components/lecture/MindMapView";
+import { AgentChatView } from "@/components/lecture/AgentChatView";
+import { ImagesView } from "@/components/lecture/ImagesView";
+import { Brain, MessageSquare, BrainCircuit, Image as ImageIcon } from "lucide-react";
 import { useLecture, useLectures } from "@/hooks/useLectures";
-import { generateSummary, generateQuiz, generateSlides, generateFlashcards } from "@/lib/aiService";
+import { generateSummary, generateQuiz, generateSlides, generateFlashcards, generateFormulas as extractMathFormulas, generateMindmap, analyzeImageWithAI } from "@/lib/aiService";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -47,19 +50,19 @@ export default function LectureView() {
   const { language, isRTL } = useLanguage();
   const [selectedModel, setSelectedModel] = useState<"gpu" | "api">("api");
 
+  // Determine visibility states based on lecture data
+  const isPresentation = !!lecture?.title?.match(/\.(pptx?)$/i);
+  const hasFormulas = lecture?.formulas && lecture.formulas.length > 0;
+
   // Track previous state to detect completion
-  const prevStateRef = useRef<{
-    transcript: boolean;
-    summary: boolean;
-    quiz: boolean;
-    slides: boolean;
-    flashcards: boolean;
-  }>({
+  const prevStateRef = useRef({
     transcript: false,
     summary: false,
+    mindmap: false,
     quiz: false,
     slides: false,
     flashcards: false,
+    formulas: false,
   });
 
   // Function to play notification sound
@@ -94,9 +97,11 @@ export default function LectureView() {
     const currentState = {
       transcript: !!(lecture.transcript && lecture.transcript.length > 0),
       summary: !!(lecture.summary && (typeof lecture.summary === 'string' ? lecture.summary.length > 0 : Array.isArray(lecture.summary) && lecture.summary.length > 0)),
+      mindmap: !!(lecture.mindmap && typeof lecture.mindmap === 'string' && lecture.mindmap.length > 0),
       quiz: !!(lecture.quiz_sets && Object.values(lecture.quiz_sets).some(set => set.length > 0)),
       slides: !!(lecture.slides && lecture.slides.length > 0),
       flashcards: !!(lecture.flashcards && lecture.flashcards.length > 0),
+      formulas: !!(lecture.formulas && lecture.formulas.length > 0),
     };
 
     const prevState = prevStateRef.current;
@@ -118,6 +123,14 @@ export default function LectureView() {
         duration: 3000,
       });
     }
+    if (currentState.mindmap && !prevState.mindmap) {
+      playNotificationSound();
+      toast({
+        title: language === "ar" ? "اكتملت الخريطة" : "Mind Map Ready",
+        description: language === "ar" ? "تم إنشاء الخريطة الذهنية بنجاح" : "Mind map has been generated successfully",
+        duration: 3000,
+      });
+    }
     if (currentState.quiz && !prevState.quiz) {
       playNotificationSound();
       toast({
@@ -126,6 +139,8 @@ export default function LectureView() {
         duration: 3000,
       });
     }
+
+
     if (currentState.slides && !prevState.slides) {
       playNotificationSound();
       toast({
@@ -143,9 +158,18 @@ export default function LectureView() {
       });
     }
 
+    if (currentState.formulas && !prevState.formulas) {
+      playNotificationSound();
+      toast({
+        title: language === "ar" ? "اكتملت المعادلات" : "Formulas Ready",
+        description: language === "ar" ? "تم استخراج المعادلات والقوانين الرياضية" : "Math formulas and laws have been extracted",
+        duration: 3000,
+      });
+    }
+
     // Update previous state
     prevStateRef.current = currentState;
-  }, [lecture?.transcript, lecture?.summary, lecture?.quiz_sets, lecture?.slides, lecture?.flashcards, lecture?.status, toast, language]);
+  }, [lecture?.transcript, lecture?.summary, lecture?.mindmap, lecture?.quiz_sets, lecture?.slides, lecture?.flashcards, lecture?.formulas, lecture?.status, toast, language]);
 
   const t = {
     loadingLecture: language === "ar" ? "جاري تحميل المحاضرة..." : "Loading lecture...",
@@ -164,9 +188,13 @@ export default function LectureView() {
     cancel: language === "ar" ? "إلغاء" : "Cancel",
     transcript: language === "ar" ? "النص الكامل" : "Transcript",
     summary: language === "ar" ? "الملخص" : "Summary",
+    mindmap: language === "ar" ? "خريطة المفاهيم" : "Mind Map",
     quiz: language === "ar" ? "الاختبار" : "Quiz",
     slides: language === "ar" ? "الشرائح" : "Slides",
     cards: language === "ar" ? "البطاقات" : "Cards",
+    formulas: language === "ar" ? "المعادلات" : "Formulas",
+    images: language === "ar" ? "الصور" : "Images",
+    agent: language === "ar" ? "اسأل الذكاء" : "Ask AI",
     status: {
       completed: language === "ar" ? "مكتمل" : "completed",
       processing: language === "ar" ? "جاري المعالجة" : "processing",
@@ -200,14 +228,16 @@ export default function LectureView() {
     loading: {
       transcript: language === "ar" ? "جاري استخراج النص..." : "Extracting transcript...",
       summary: language === "ar" ? "جاري إنشاء الملخص..." : "Generating summary...",
+      mindmap: language === "ar" ? "جاري إنشاء الخريطة..." : "Generating mind map...",
       quiz: language === "ar" ? "جاري إنشاء الاختبار..." : "Generating quiz...",
       slides: language === "ar" ? "جاري إنشاء الشرائح..." : "Generating slides...",
       flashcards: language === "ar" ? "جاري إنشاء البطاقات..." : "Generating flashcards...",
+      formulas: language === "ar" ? "جاري استخراج المعادلات..." : "Extracting formulas...",
     },
   };
 
   // Helper function to check if a section is loading
-  const isSectionLoading = (section: "transcript" | "summary" | "quiz" | "slides" | "flashcards") => {
+  const isSectionLoading = (section: "transcript" | "summary" | "mindmap" | "quiz" | "slides" | "flashcards" | "formulas") => {
     if (!lecture || lecture.status !== "processing") return false;
     const progress = lecture.progress || 0;
 
@@ -219,6 +249,8 @@ export default function LectureView() {
         // Show loading if progress < 60 OR if summary doesn't exist yet
         // Also show if we're in the summary processing range (40-60)
         return (progress < 60 || !lecture.summary || (typeof lecture.summary === 'string' ? lecture.summary.length === 0 : Array.isArray(lecture.summary) && lecture.summary.length === 0));
+      case "mindmap":
+        return (progress < 65 || !lecture.mindmap || lecture.mindmap.length === 0);
       case "quiz":
         // Show loading if progress < 80 OR if quiz_sets don't exist yet
         return (progress < 80 || !lecture.quiz_sets || !Object.values(lecture.quiz_sets).some(set => set.length > 0));
@@ -230,13 +262,17 @@ export default function LectureView() {
         // Show loading if progress < 100 OR if flashcards don't exist yet
         // Also show if we're in the flashcards processing range (90-100)
         return (progress < 100 || !lecture.flashcards || lecture.flashcards.length === 0);
+      case "formulas":
+        // Formulas are generated after summary and before final completion.
+        // Show loading while processing and formulas are not yet available.
+        return (lecture.status === "processing" && (!lecture.formulas || lecture.formulas.length === 0));
       default:
         return false;
     }
   };
 
   // Loading component for each section
-  const SectionLoading = ({ section, icon: Icon }: { section: "transcript" | "summary" | "quiz" | "slides" | "flashcards", icon: any }) => {
+  const SectionLoading = ({ section, icon: Icon }: { section: "transcript" | "summary" | "mindmap" | "quiz" | "slides" | "flashcards" | "formulas", icon: any }) => {
     const getProgress = () => {
       if (!lecture?.progress) return 0;
       const progress = lecture.progress;
@@ -252,12 +288,17 @@ export default function LectureView() {
           if (progress >= 60) return 100;
           // Show progress from 0% to 100% within the 40-60% range
           return Math.min(((progress - 40) / 20) * 100, 100);
-        case "quiz":
-          // Quiz: 60-80% of overall progress
+        case "mindmap":
           if (progress < 60) return 0;
+          if (progress >= 70) return 100;
+          return Math.min(((progress - 60) / 10) * 100, 100);
+
+        case "quiz":
+          // Quiz: 70-80% of overall progress
+          if (progress < 70) return 0;
           if (progress >= 80) return 100;
-          // Show progress from 0% to 100% within the 60-80% range
-          return Math.min(((progress - 60) / 20) * 100, 100);
+          // Show progress from 0% to 100% within the 70-80% range
+          return Math.min(((progress - 70) / 10) * 100, 100);
         case "slides":
           // Slides: 80-90% of overall progress
           if (progress < 80) return 0;
@@ -270,6 +311,11 @@ export default function LectureView() {
           if (progress >= 100) return 100;
           // Show progress from 0% to 100% within the 90-100% range
           return Math.min(((progress - 90) / 10) * 100, 100);
+        case "formulas":
+          // Formulas: approximate between 60-80 based on overall progress
+          if (progress < 60) return 0;
+          if (progress >= 80) return 100;
+          return Math.min(((progress - 60) / 20) * 100, 100);
         default:
           return 0;
       }
@@ -532,6 +578,50 @@ export default function LectureView() {
     }
   };
 
+  const handleImageAnalysis = async (imgUrl: string) => {
+    if (!lecture || !lecture.extractedImages) return;
+
+    // Find the image index we are analyzing
+    const imgIndex = lecture.extractedImages.findIndex(img => img.url === imgUrl);
+    if (imgIndex === -1) return;
+
+    // Optional: show a loading toast
+    toast({
+      title: language === "ar" ? "جاري تحليل الصورة..." : "Analyzing Image...",
+      description: language === "ar" ? "الذكاء الاصطناعي يقوم بقراءة محتوى الصورة." : "AI is reading the image content.",
+    });
+
+    try {
+      // Create a temporary state so we don't block
+      const updatedImages = [...lecture.extractedImages];
+      updatedImages[imgIndex] = { ...updatedImages[imgIndex], description: "Analyzing..." }; // Visual loading indicator
+
+      // We'll optimistically update if you had local state, but let's just wait for API since we have the DB state
+
+      const description = await analyzeImageWithAI(imgUrl, lecture.transcript || "");
+
+      updatedImages[imgIndex] = { ...updatedImages[imgIndex], description };
+
+      await updateLecture({
+        lectureId: lecture.id,
+        updates: { extractedImages: updatedImages }
+      });
+
+      toast({
+        title: language === "ar" ? "نجح التحليل" : "Analysis Complete",
+        description: language === "ar" ? "تم إضافة شرح الصورة." : "Image description added.",
+      });
+
+    } catch (e: any) {
+      console.error("Image analysis failed:", e);
+      toast({
+        title: language === "ar" ? "فشل التحليل" : "Analysis Failed",
+        description: e.message || "Could not analyze the image",
+        variant: "destructive"
+      });
+    }
+  };
+
   const handleDelete = async () => {
     if (!lecture) return;
     try {
@@ -619,20 +709,20 @@ export default function LectureView() {
           modelType: selectedModel, // Update model type
           // optionally clear previous AI outputs
           summary: [],
+          mindmap: "",
           quiz_sets: { easy: [], medium: [], hard: [] },
           slides: [],
           flashcards: [],
+          formulas: [],
         },
       });
 
       toast({
-        title: t.toast.reprocessStarted,
+        title: language === "ar" ? "جاري المعالجة" : "Processing",
         description: t.toast.reprocessStartedDesc,
       });
 
       const transcript = lecture.transcript;
-
-      // Generate summary with selected model
       const summary = await generateSummary(transcript, selectedModel);
       await updateLecture({
         lectureId: lecture.id,
@@ -642,12 +732,32 @@ export default function LectureView() {
         },
       });
 
+      // Generate flashcards first so we can use them for the mind map
+      const flashcards = await generateFlashcards(transcript, selectedModel);
+      await updateLecture({
+        lectureId: lecture.id,
+        updates: {
+          progress: 55,
+          flashcards,
+        },
+      });
+
+      // Generate mindmap using flashcards
+      const mindmap = await generateMindmap(transcript, selectedModel, flashcards);
+      await updateLecture({
+        lectureId: lecture.id,
+        updates: {
+          progress: 65,
+          mindmap,
+        },
+      });
+
       // Generate quiz with selected model
       const questions = await generateQuiz(transcript, selectedModel, "comprehensive", lecture.title);
       await updateLecture({
         lectureId: lecture.id,
         updates: {
-          progress: 75,
+          progress: 80,
           questions: questions as any,
         },
       });
@@ -657,18 +767,27 @@ export default function LectureView() {
       await updateLecture({
         lectureId: lecture.id,
         updates: {
-          progress: 90,
+          progress: 95,
           slides,
         },
       });
 
-      // Generate flashcards
-      const flashcards = await generateFlashcards(transcript, selectedModel);
+      // Generate formulas unconditionally
+      const formulas = await extractMathFormulas(
+        transcript,
+        selectedModel,
+        lecture?.geminiFileUri,
+        lecture?.geminiFileMimeType
+      );
+
       await updateLecture({
         lectureId: lecture.id,
         updates: {
           progress: 100,
+          summary,
+          mindmap,
           flashcards,
+          formulas,
           status: "completed",
           modelType: selectedModel, // Ensure model type is saved
         },
@@ -960,9 +1079,9 @@ export default function LectureView() {
 
           <Tabs defaultValue="summary" className="w-full">
             <div className="border-b border-border/40 mb-6">
-              <TabsList className={`grid w-full grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 h-auto bg-transparent p-0 gap-1 ${language === "ar" ? "[direction:rtl]" : ""}`}>
+              <TabsList className={`grid w-full grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 h-auto bg-transparent p-0 gap-1 ${language === "ar" ? "[direction:rtl]" : ""}`}>
                 {language === "ar" ? (
-                  // Arabic order: النص الكامل > الملخص > الاختبار > الشرائح > البطاقات (from right to left)
+                  // Arabic order: النص الكامل > الملخص > الاختبار > الشرائح > المعادلات > البطاقات (from right to left)
                   <>
                     <TabsTrigger
                       value="transcript"
@@ -979,19 +1098,37 @@ export default function LectureView() {
                       <span className="hidden sm:inline">{t.summary}</span>
                     </TabsTrigger>
                     <TabsTrigger
+                      value="mindmap"
+                      className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                    >
+                      <BrainCircuit className="w-4 h-4 ml-2" />
+                      <span className="hidden sm:inline">{t.mindmap || "Mind Map"}</span>
+                    </TabsTrigger>
+                    <TabsTrigger
                       value="quiz"
                       className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
                     >
                       <HelpCircle className="w-4 h-4 ml-2" />
                       <span className="hidden sm:inline">{t.quiz}</span>
                     </TabsTrigger>
-                    <TabsTrigger
-                      value="slides"
-                      className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
-                    >
-                      <Presentation className="w-4 h-4 ml-2" />
-                      <span className="hidden sm:inline">{t.slides}</span>
-                    </TabsTrigger>
+                    {!isPresentation && (
+                      <TabsTrigger
+                        value="slides"
+                        className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                      >
+                        <Presentation className="w-4 h-4 ml-2" />
+                        <span className="hidden sm:inline">{t.slides}</span>
+                      </TabsTrigger>
+                    )}
+                    {hasFormulas && (
+                      <TabsTrigger
+                        value="formulas"
+                        className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                      >
+                        <Sigma className="w-4 h-4 ml-2" />
+                        <span className="hidden sm:inline">{t.formulas}</span>
+                      </TabsTrigger>
+                    )}
                     <TabsTrigger
                       value="flashcards"
                       className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
@@ -999,9 +1136,25 @@ export default function LectureView() {
                       <Brain className="w-4 h-4 ml-2" />
                       <span className="hidden sm:inline">{t.cards}</span>
                     </TabsTrigger>
+                    {(lecture.extractedImages && lecture.extractedImages.length > 0) || isPresentation || lecture?.title?.match(/\.(pdf)$/i) ? (
+                      <TabsTrigger
+                        value="images"
+                        className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                      >
+                        <ImageIcon className="w-4 h-4 ml-2" />
+                        <span className="hidden sm:inline">{t.images}</span>
+                      </TabsTrigger>
+                    ) : null}
+                    <TabsTrigger
+                      value="agent"
+                      className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                    >
+                      <MessageSquare className="w-4 h-4 ml-2" />
+                      <span className="hidden sm:inline">{t.agent}</span>
+                    </TabsTrigger>
                   </>
                 ) : (
-                  // English order: Transcript > Summary > Quiz > Slides > Flashcards (from left to right)
+                  // English order: Transcript > Summary > Quiz > Slides > Formulas > Flashcards (from left to right)
                   <>
                     <TabsTrigger
                       value="transcript"
@@ -1018,25 +1171,59 @@ export default function LectureView() {
                       <span className="hidden sm:inline">{t.summary}</span>
                     </TabsTrigger>
                     <TabsTrigger
+                      value="mindmap"
+                      className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                    >
+                      <BrainCircuit className="w-4 h-4 mr-2" />
+                      <span className="hidden sm:inline">{t.mindmap || "Mind Map"}</span>
+                    </TabsTrigger>
+                    <TabsTrigger
                       value="quiz"
                       className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
                     >
                       <HelpCircle className="w-4 h-4 mr-2" />
                       <span className="hidden sm:inline">{t.quiz}</span>
                     </TabsTrigger>
-                    <TabsTrigger
-                      value="slides"
-                      className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
-                    >
-                      <Presentation className="w-4 h-4 mr-2" />
-                      <span className="hidden sm:inline">{t.slides}</span>
-                    </TabsTrigger>
+                    {!isPresentation && (
+                      <TabsTrigger
+                        value="slides"
+                        className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                      >
+                        <Presentation className="w-4 h-4 mr-2" />
+                        <span className="hidden sm:inline">{t.slides}</span>
+                      </TabsTrigger>
+                    )}
+                    {hasFormulas && (
+                      <TabsTrigger
+                        value="formulas"
+                        className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                      >
+                        <Sigma className="w-4 h-4 mr-2" />
+                        <span className="hidden sm:inline">{t.formulas}</span>
+                      </TabsTrigger>
+                    )}
                     <TabsTrigger
                       value="flashcards"
                       className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
                     >
                       <Brain className="w-4 h-4 mr-2" />
                       <span className="hidden sm:inline">{t.cards}</span>
+                    </TabsTrigger>
+                    {(lecture.extractedImages && lecture.extractedImages.length > 0) || isPresentation || lecture?.title?.match(/\.(pdf)$/i) ? (
+                      <TabsTrigger
+                        value="images"
+                        className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                      >
+                        <ImageIcon className="w-4 h-4 mr-2" />
+                        <span className="hidden sm:inline">{t.images}</span>
+                      </TabsTrigger>
+                    ) : null}
+                    <TabsTrigger
+                      value="agent"
+                      className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm rounded-lg px-4 py-2.5 transition-all"
+                    >
+                      <MessageSquare className="w-4 h-4 mr-2" />
+                      <span className="hidden sm:inline">{t.agent}</span>
                     </TabsTrigger>
                   </>
                 )}
@@ -1060,6 +1247,14 @@ export default function LectureView() {
                 )}
               </TabsContent>
 
+              <TabsContent value="mindmap" className="mt-0 animate-in fade-in-50 duration-300">
+                {isSectionLoading("mindmap") ? (
+                  <SectionLoading section="mindmap" icon={BrainCircuit} />
+                ) : (
+                  <MindMapView mindmapCode={lecture.mindmap} />
+                )}
+              </TabsContent>
+
               <TabsContent value="quiz" className="mt-0 animate-in fade-in-50 duration-300">
                 {isSectionLoading("quiz") ? (
                   <SectionLoading section="quiz" icon={HelpCircle} />
@@ -1074,19 +1269,31 @@ export default function LectureView() {
                 )}
               </TabsContent>
 
-              <TabsContent value="slides" className="mt-0 animate-in fade-in-50 duration-300">
-                {isSectionLoading("slides") ? (
-                  <SectionLoading section="slides" icon={Presentation} />
-                ) : (
-                  <SlidesView
-                    slides={lecture.slides || []}
-                    title={lecture.title}
-                    transcript={lecture.transcript}
-                    summary={lecture.summary}
-                    lectureId={lecture.id}
-                  />
-                )}
-              </TabsContent>
+              {!isPresentation && (
+                <TabsContent value="slides" className="mt-0 animate-in fade-in-50 duration-300">
+                  {isSectionLoading("slides") ? (
+                    <SectionLoading section="slides" icon={Presentation} />
+                  ) : (
+                    <SlidesView
+                      slides={lecture.slides || []}
+                      title={lecture.title}
+                      transcript={lecture.transcript}
+                      summary={lecture.summary}
+                      lectureId={lecture.id}
+                    />
+                  )}
+                </TabsContent>
+              )}
+
+              {hasFormulas && (
+                <TabsContent value="formulas" className="mt-0 animate-in fade-in-50 duration-300">
+                  {isSectionLoading("formulas") ? (
+                    <SectionLoading section="formulas" icon={Sigma} />
+                  ) : (
+                    <FormulasView formulas={lecture.formulas || []} />
+                  )}
+                </TabsContent>
+              )}
 
               <TabsContent value="flashcards" className="mt-0 animate-in fade-in-50 duration-300">
                 {isSectionLoading("flashcards") ? (
@@ -1095,11 +1302,36 @@ export default function LectureView() {
                   <FlashcardsView flashcards={lecture.flashcards || []} />
                 )}
               </TabsContent>
+
+              <TabsContent value="images" className="mt-0 animate-in fade-in-50 duration-300">
+                {(lecture.extractedImages && lecture.extractedImages.length > 0) ? (
+                  <ImagesView
+                    lectureId={lecture.id}
+                    images={lecture.extractedImages}
+                    onAnalysisRequested={handleImageAnalysis}
+                  />
+                ) : (
+                  <div className="flex flex-col items-center justify-center p-12 text-center text-muted-foreground bg-card rounded-lg border border-border">
+                    <ImageIcon className="w-12 h-12 mb-4 text-muted" />
+                    <h3 className="text-lg font-semibold mb-2">
+                      {language === "ar" ? "لا توجد صور" : "No Images Found"}
+                    </h3>
+                    <p>
+                      {language === "ar"
+                        ? "لم يتم العثور على أي صور في هذا الملف، أو تعذر استخراجها."
+                        : "No images were found in this document, or they could not be extracted."}
+                    </p>
+                  </div>
+                )}
+              </TabsContent>
+
+              <TabsContent value="agent" className="mt-0 animate-in fade-in-50 duration-300">
+                <AgentChatView transcript={lecture.transcript || ""} title={lecture.title} mode={selectedModel} />
+              </TabsContent>
             </div>
           </Tabs>
         </motion.div>
       </div>
-      <ChatAssistant />
     </AppLayout>
   );
 }

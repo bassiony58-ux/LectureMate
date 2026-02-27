@@ -1,4 +1,5 @@
-import { Lecture, LectureCategory } from "./mockData";
+import { type Lecture, type LectureCategory } from "./mockData";
+export { type Lecture, type LectureCategory };
 import { classifyCategory } from "./aiService";
 
 // Category keywords mapping
@@ -65,10 +66,10 @@ export async function classifyLecture(
 ): Promise<LectureCategory> {
   // Try AI classification first
   try {
-    const summaryText = typeof lecture.summary === "string" 
-      ? lecture.summary 
-      : Array.isArray(lecture.summary) 
-        ? lecture.summary.join(" ") 
+    const summaryText = typeof lecture.summary === "string"
+      ? lecture.summary
+      : Array.isArray(lecture.summary)
+        ? lecture.summary.join(" ")
         : "";
 
     const aiCategory = await classifyCategory(
@@ -136,7 +137,7 @@ function classifyLectureByKeywords(lecture: Partial<Lecture>): LectureCategory {
   // Score each category
   for (const [category, keywords] of Object.entries(categoryKeywords)) {
     if (category === "other") continue;
-    
+
     for (const keyword of keywords) {
       const regex = new RegExp(`\\b${keyword}\\b`, "gi");
       const matches = text.match(regex);
@@ -161,18 +162,18 @@ function classifyLectureByKeywords(lecture: Partial<Lecture>): LectureCategory {
   if (maxScore === 0) {
     const title = lecture.title?.toLowerCase() || "";
     const transcriptLower = (lecture.transcript || "").toLowerCase();
-    
+
     // Only classify as technology if there's a STRONG indication it's about programming/tech
     // Not just mentioning "ai" or "agent" in passing
     const techKeywords = ["programming", "coding", "software", "computer", "algorithm", "code", "developer", "tech"];
-    const hasStrongTechIndication = techKeywords.some(keyword => 
+    const hasStrongTechIndication = techKeywords.some(keyword =>
       title.includes(keyword) || transcriptLower.includes(keyword)
     );
-    
+
     if (hasStrongTechIndication) {
       return "technology";
     }
-    
+
     // Check for other specific patterns
     if (title.includes("introduction to") || title.includes("basics of")) {
       // Try to determine the subject from the title
@@ -187,7 +188,7 @@ function classifyLectureByKeywords(lecture: Partial<Lecture>): LectureCategory {
       }
       return "education";
     }
-    
+
     // Check for subject-specific patterns
     if (title.includes("how to") || title.includes("tutorial")) {
       return "education";

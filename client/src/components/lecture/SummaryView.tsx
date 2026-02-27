@@ -7,6 +7,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useLanguage } from "@/contexts/LanguageContext";
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
+import { TextWithMath } from "./FormulasView";
 
 interface SummaryViewProps {
   summary: string | string[]; // Support both long-form string (new) and array (legacy)
@@ -189,8 +190,8 @@ export function SummaryView({ summary, title }: SummaryViewProps) {
     return summaryText.split(/\n\s*\n/).filter((p) => p.trim().length > 0);
   }, [isLongForm, summaryText]);
 
-  // Function to render text with bold formatting (**text**)
-  const renderBoldText = (text: string): ReactNode => {
+  // Function to render text with bold formatting (**text**) and Math
+  const renderFormattedText = (text: string): ReactNode => {
     const parts: (string | ReactNode)[] = [];
     const regex = /\*\*(.+?)\*\*/g;
     let lastIndex = 0;
@@ -200,22 +201,22 @@ export function SummaryView({ summary, title }: SummaryViewProps) {
     while ((match = regex.exec(text)) !== null) {
       // Add text before the match
       if (match.index > lastIndex) {
-        parts.push(text.substring(lastIndex, match.index));
+        parts.push(<TextWithMath key={`t1-${key}`} text={text.substring(lastIndex, match.index)} />);
       }
       // Add bold text
       parts.push(
-        <strong key={key++} className="font-semibold text-foreground">
-          {match[1]}
+        <strong key={`b-${key++}`} className="font-semibold text-foreground">
+          <TextWithMath text={match[1]} />
         </strong>
       );
       lastIndex = regex.lastIndex;
     }
     // Add remaining text
     if (lastIndex < text.length) {
-      parts.push(text.substring(lastIndex));
+      parts.push(<TextWithMath key={`t2-${key}`} text={text.substring(lastIndex)} />);
     }
 
-    return parts.length > 0 ? parts : text;
+    return parts.length > 0 ? parts : <TextWithMath text={text} />;
   };
 
   const handleShare = async () => {
@@ -516,7 +517,7 @@ export function SummaryView({ summary, title }: SummaryViewProps) {
                   dir={contentDir}
                   style={{ textAlign: displayTextAlign }}
                 >
-                  {renderBoldText(parsedSections.intro)}
+                  {renderFormattedText(parsedSections.intro)}
                 </p>
               </CardContent>
             </Card>
@@ -546,7 +547,7 @@ export function SummaryView({ summary, title }: SummaryViewProps) {
                         dir={contentDir}
                         style={{ textAlign: displayTextAlign }}
                       >
-                        {renderBoldText(paragraph.trim())}
+                        {renderFormattedText(paragraph.trim())}
                       </motion.p>
                     ))}
                 </div>
@@ -588,7 +589,7 @@ export function SummaryView({ summary, title }: SummaryViewProps) {
                           className="text-foreground"
                         >
                           <span className="font-semibold text-primary">{label}</span>
-                          {rest ? <span>: {renderBoldText(rest)}</span> : ""}
+                          {rest ? <span>: {renderFormattedText(rest)}</span> : ""}
                         </motion.li>
                       );
                     }
@@ -601,7 +602,7 @@ export function SummaryView({ summary, title }: SummaryViewProps) {
                         transition={{ duration: 0.3, delay: idx * 0.05 }}
                         className="text-foreground"
                       >
-                        {renderBoldText(point)}
+                        {renderFormattedText(point)}
                       </motion.li>
                     );
                   })}
@@ -625,7 +626,7 @@ export function SummaryView({ summary, title }: SummaryViewProps) {
                   dir={contentDir}
                   style={{ textAlign: displayTextAlign }}
                 >
-                  {renderBoldText(paragraph.trim())}
+                  {renderFormattedText(paragraph.trim())}
                 </motion.p>
               ))}
             </div>

@@ -14,6 +14,7 @@ export interface AIQuestion {
   type: "multiple_choice" | "true_false" | "open_ended";
   is_numerical?: boolean;
   expected_keywords?: string[] | null;
+  numerical_answer?: string | number | null;
   reference?: {
     source_type: "uploaded_content" | "related_topic";
     location: string;
@@ -122,6 +123,7 @@ export async function generateQuiz(transcript: string, mode: "gpu" | "api" = "ap
         correct_answer: q.correct_answer ?? null,
         is_numerical: q.is_numerical ?? false,
         expected_keywords: q.expected_keywords ?? null,
+        numerical_answer: q.numerical_answer ?? null,
         reference: q.reference ?? null
       }));
     };
@@ -291,6 +293,89 @@ export async function generateFlashcards(transcript: string, mode: "gpu" | "api"
   }
 }
 
+// Generate formulas from transcript
+export async function generateFormulas(
+  transcript: string,
+  mode: "gpu" | "api" = "api",
+  geminiFileUri?: string,
+  geminiFileMimeType?: string
+): Promise<any[]> {
+  try {
+    if (!transcript || transcript.length < 200) {
+      return [];
+    }
+
+    const response = await fetch("/api/ai/formulas", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        transcript,
+        mode,
+        geminiFileUri,
+        geminiFileMimeType,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || "Failed to generate formulas");
+    }
+
+    const data = await response.json();
+
+    if (!data.formulas || !Array.isArray(data.formulas)) {
+      throw new Error("Invalid formulas format received");
+    }
+
+    console.log(`[aiService] AI formulas generated with ${data.formulas.length} formulas`);
+    return data.formulas;
+  } catch (error: any) {
+    console.error("[aiService] Error generating formulas:", error);
+    // Graceful degradation: return empty array
+    return [];
+  }
+}
+
+
+// Generate mind map from transcript
+export async function generateMindmap(
+  transcript: string,
+  mode: string = "api",
+  flashcards?: any[]
+): Promise<any> {
+  try {
+    if ((!transcript || transcript.length < 200) && (!flashcards || flashcards.length === 0)) {
+      return null;
+    }
+
+    const response = await fetch("/api/ai/mindmap", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        transcript,
+        flashcards,
+        mode,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || "Failed to generate mind map");
+    }
+
+    const data = await response.json();
+    return data.mindmap;
+  } catch (error: any) {
+    console.error("[aiService] Error generating mind map:", error);
+    return null;
+  }
+}
+
+
 // Classify lecture category using AI
 export async function classifyCategory(
   title?: string,
@@ -399,3 +484,86 @@ export async function downloadSlidesPptx(
   }
 }
 
+// Chat with Agent using AI
+export async function chatWithAgent(
+  transcript: string,
+  message: string,
+  history: { role: string, content: string }[] = [],
+  mode: "gpu" | "api" = "api"
+): Promise<string> {
+  try {
+    const response = await fetch("/api/ai/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transcript, message, history, mode }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || "Failed to get AI response");
+    }
+
+    const data = await response.json();
+    return data.reply || "";
+  } catch (error: any) {
+    console.error("[aiService] Error in chatWithAgent:", error);
+    throw error;
+  }
+}
+
+export interface EssayEvaluation {
+  similarityScore: number;
+  isCorrect: boolean;
+  feedback: string;
+  correctAnswer: string;
+}
+
+// Evaluate user's essay answer using AI
+export async function evaluateEssayAnswer(
+  question: string,
+  userAnswer: string,
+  correctAnswer: string,
+  expectedKeywords: string[] = [],
+  numericalAnswer?: string | number | null
+): Promise<EssayEvaluation> {
+  try {
+    const response = await fetch("/api/ai/evaluate-answer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, userAnswer, correctAnswer, expectedKeywords, numericalAnswer }),
+    });
+
+    if (!response.ok) {
+      throw new Error("Failed to evaluate answer");
+    }
+
+    const data = await response.json();
+    return data;
+  } catch (error: any) {
+    console.error("[aiService] Error evaluating essay answer:", error);
+    throw error;
+  }
+}
+
+// Analyze extracted image with Gemini Vision
+export async function analyzeImageWithAI(imageUrl: string, transcript?: string): Promise<string> {
+  try {
+    console.log(`[aiService] Requesting image analysis...`);
+    const response = await fetch("/api/ai/analyze-image", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ imageUrl, transcript }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || "Failed to analyze image");
+    }
+
+    const data = await response.json();
+    return data.description || "";
+  } catch (error: any) {
+    console.error(`[aiService] Error analyzing image ${imageUrl}:`, error);
+    throw error;
+  }
+}

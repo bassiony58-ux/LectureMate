@@ -35,7 +35,7 @@ export async function getYouTubeVideoInfo(
 ): Promise<YouTubeVideoInfo | null> {
   try {
     console.log(`[youtubeService] Fetching video info for: ${videoId}`);
-    
+
     // Call backend API endpoint to fetch video info
     const response = await fetch("/api/youtube/info", {
       method: "POST",
@@ -128,21 +128,21 @@ export async function getYouTubeTranscript(
       console.error("[youtubeService] API error:", errorMessage);
       throw new Error(errorMessage);
     }
-    
+
     if (!data.transcript || data.transcript.length === 0) {
       console.error("[youtubeService] Empty transcript received");
       throw new Error(data.error || "No transcript available for this video");
     }
-    
+
     console.log("[youtubeService] Transcript received successfully:", {
       length: data.transcript.length,
       preview: data.transcript.substring(0, 100)
     });
-    
+
     return data.transcript;
   } catch (error: any) {
     console.error("Error fetching transcript:", error);
-    
+
     // Re-throw the error with the message from the server
     throw error;
   }
@@ -155,10 +155,10 @@ export async function transcribeAudioFile(
   language?: string,
   device: string = "cuda",
   lectureId?: string
-): Promise<string | null> {
+): Promise<{ transcript: string; geminiFileUri?: string; geminiFileMimeType?: string; extractedImages?: { url: string, description: string, analyzed?: boolean }[] } | string | null> {
   try {
     console.log(`[audioService] Transcribing audio file: ${file.name} (${file.size} bytes)`);
-    
+
     // Create FormData for file upload
     const formData = new FormData();
     formData.append("audio", file);
@@ -187,6 +187,7 @@ export async function transcribeAudioFile(
       status: response.status,
       hasTranscript: !!data.transcript,
       transcriptLength: data.transcript?.length || 0,
+      hasExtractedImages: !!data.extractedImages,
       error: data.error
     });
 
@@ -195,19 +196,24 @@ export async function transcribeAudioFile(
       console.error("[audioService] API error:", errorMessage);
       throw new Error(errorMessage);
     }
-    
+
     if (!data.transcript || data.transcript.length === 0) {
       console.error("[audioService] Empty transcript received");
       throw new Error(data.error || "No transcript generated from audio file");
     }
-    
+
     console.log("[audioService] Transcript received successfully:", {
       length: data.transcript.length,
       preview: data.transcript.substring(0, 100),
       language: data.language
     });
-    
-    return data.transcript;
+
+    return {
+      transcript: data.transcript,
+      geminiFileUri: data.geminiFileUri,
+      geminiFileMimeType: data.geminiFileMimeType,
+      extractedImages: data.extractedImages
+    };
   } catch (error: any) {
     console.error("[audioService] Error transcribing audio:", error);
     throw error;
@@ -226,17 +232,17 @@ export async function transcribeYouTubeWithWhisper(
   videoTitle?: string,
   channelName?: string,
   lectureId?: string
-): Promise<string | null> {
+): Promise<{ transcript: string; geminiFileUri?: string; geminiFileMimeType?: string; } | string | null> {
   try {
     console.log(`[youtubeService] Transcribing YouTube video with Whisper: ${videoId}`);
-    
+
     // Build request body
     const requestBody: any = {
       videoId,
       modelSize,
       device,
     };
-    
+
     if (userId) {
       requestBody.userId = userId;
     }
@@ -287,19 +293,23 @@ export async function transcribeYouTubeWithWhisper(
       console.error("[youtubeService] API error:", errorMessage);
       throw new Error(errorMessage);
     }
-    
+
     if (!data.transcript || data.transcript.length === 0) {
       console.error("[youtubeService] Empty transcript received");
       throw new Error(data.error || "No transcript generated from YouTube audio");
     }
-    
+
     console.log("[youtubeService] Transcript received successfully:", {
       length: data.transcript.length,
       preview: data.transcript.substring(0, 100),
       language: data.language
     });
-    
-    return data.transcript;
+
+    return {
+      transcript: data.transcript,
+      geminiFileUri: data.geminiFileUri,
+      geminiFileMimeType: data.geminiFileMimeType
+    };
   } catch (error: any) {
     console.error("[youtubeService] Error transcribing YouTube with Whisper:", error);
     throw error;

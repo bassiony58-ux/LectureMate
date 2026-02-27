@@ -13,7 +13,7 @@ import {
   type Firestore,
 } from "firebase/firestore";
 import { db } from "./firebase";
-import type { Lecture, Question, Slide, Flashcard } from "./mockData";
+import type { Lecture, Question, Slide, Flashcard, Formula } from "./mockData";
 
 // Helper to remove undefined values recursively (Firestore doesn't allow undefined)
 function cleanData(obj: any): any {
@@ -45,8 +45,12 @@ function firestoreToLecture(docData: any, id: string): Lecture {
     quiz_sets: docData.quiz_sets || undefined, // Read quiz_sets from Firestore
     slides: docData.slides || [],
     flashcards: docData.flashcards || [],
+    formulas: docData.formulas || [],
     modelType: docData.modelType || undefined, // Read modelType from Firestore
     category: docData.category || undefined, // Read category from Firestore
+    geminiFileUri: docData.geminiFileUri || undefined,
+    geminiFileMimeType: docData.geminiFileMimeType || undefined,
+    extractedImages: docData.extractedImages || undefined,
   };
 }
 
@@ -67,8 +71,12 @@ function lectureToFirestore(lecture: Partial<Lecture>): any {
   if (lecture.quiz_sets !== undefined && lecture.quiz_sets !== null) data.quiz_sets = lecture.quiz_sets;
   if (lecture.slides !== undefined && lecture.slides !== null) data.slides = lecture.slides;
   if (lecture.flashcards !== undefined && lecture.flashcards !== null) data.flashcards = lecture.flashcards;
+  if (lecture.formulas !== undefined && lecture.formulas !== null) data.formulas = lecture.formulas;
   if (lecture.modelType !== undefined && lecture.modelType !== null) data.modelType = lecture.modelType;
   if (lecture.category !== undefined && lecture.category !== null) data.category = lecture.category;
+  if (lecture.geminiFileUri !== undefined && lecture.geminiFileUri !== null) data.geminiFileUri = lecture.geminiFileUri;
+  if (lecture.geminiFileMimeType !== undefined && lecture.geminiFileMimeType !== null) data.geminiFileMimeType = lecture.geminiFileMimeType;
+  if (lecture.extractedImages !== undefined && lecture.extractedImages !== null) data.extractedImages = lecture.extractedImages;
 
   return data;
 }
@@ -90,8 +98,12 @@ function updatesToFirestore(updates: Partial<Lecture>): any {
   if (updates.quiz_sets !== undefined && updates.quiz_sets !== null) data.quiz_sets = updates.quiz_sets;
   if (updates.slides !== undefined && updates.slides !== null) data.slides = updates.slides;
   if (updates.flashcards !== undefined && updates.flashcards !== null) data.flashcards = updates.flashcards;
+  if (updates.formulas !== undefined && updates.formulas !== null) data.formulas = updates.formulas;
   if (updates.modelType !== undefined && updates.modelType !== null) data.modelType = updates.modelType;
   if (updates.category !== undefined && updates.category !== null) data.category = updates.category;
+  if (updates.geminiFileUri !== undefined && updates.geminiFileUri !== null) data.geminiFileUri = updates.geminiFileUri;
+  if (updates.geminiFileMimeType !== undefined && updates.geminiFileMimeType !== null) data.geminiFileMimeType = updates.geminiFileMimeType;
+  if (updates.extractedImages !== undefined && updates.extractedImages !== null) data.extractedImages = updates.extractedImages;
 
   // Always update the updatedAt timestamp
   data.updatedAt = Timestamp.now();
@@ -191,7 +203,7 @@ export const lectureService = {
     } catch (error: any) {
       console.error("[lectureService] Error updating lecture:", error);
       if (error.code === 'permission-denied') {
-        console.error("[lectureService] Permission denied! Check your Firestore rules. Allowed keys: ['title', 'thumbnailUrl', 'duration', 'date', 'status', 'progress', 'summary', 'transcript', 'questions', 'slides', 'flashcards', 'category', 'modelType', 'updatedAt']");
+        console.error("[lectureService] Permission denied! Check your Firestore rules. Allowed keys: ['title', 'thumbnailUrl', 'duration', 'date', 'status', 'progress', 'summary', 'transcript', 'questions', 'slides', 'flashcards', 'formulas', 'category', 'modelType', 'updatedAt']");
       }
       throw error;
     }

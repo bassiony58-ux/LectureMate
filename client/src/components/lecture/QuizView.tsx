@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import { Question } from "@/lib/mockData";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { CheckCircle, XCircle, HelpCircle, ArrowRight, RotateCcw, Download, Eye, EyeOff, Info, Search, BookOpen, Sparkles, Target } from "lucide-react";
+import { CheckCircle, XCircle, HelpCircle, ArrowRight, RotateCcw, Download, Eye, EyeOff, Info, Search, BookOpen, Sparkles, Target, Timer } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { motion, AnimatePresence } from "framer-motion";
@@ -12,7 +12,7 @@ import { useToast } from "@/hooks/use-toast";
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
 
-import { generateQuiz } from "@/lib/aiService";
+import { generateQuiz, evaluateEssayAnswer, EssayEvaluation } from "@/lib/aiService";
 import { useLectures } from "@/hooks/useLectures";
 
 interface QuizViewProps {
@@ -103,40 +103,88 @@ export function QuizView({ questions: initialQuestions, title = "Quiz", lectureI
   const [quizComplete, setQuizComplete] = useState(false);
   const [userAnswers, setUserAnswers] = useState<Record<number, number>>({});
   const [userTextAnswers, setUserTextAnswers] = useState<Record<number, string>>({});
+  const [userEssayEvaluations, setUserEssayEvaluations] = useState<Record<number, EssayEvaluation>>({});
+  const [isEvaluating, setIsEvaluating] = useState(false);
   const [isChoosingLevel, setIsChoosingLevel] = useState(false);
+  const [timeLeft, setTimeLeft] = useState<number | null>(null);
 
   const currentQuestion = questions[currentQuestionIndex];
+
+  // Restart timer on new question
+  useEffect(() => {
+    if (quizMode === "quiz" && !isAnswered && currentQuestion?.type !== "open_ended") {
+      setTimeLeft(30);
+    } else {
+      setTimeLeft(null);
+    }
+  }, [quizMode, currentQuestionIndex, isAnswered, currentQuestion]);
+
+  // Handle countdown
+  useEffect(() => {
+    if (timeLeft === null || timeLeft <= 0 || isAnswered || quizMode !== "quiz") return;
+
+    const timerId = setInterval(() => {
+      setTimeLeft(prev => (prev !== null && prev > 0 ? prev - 1 : 0));
+    }, 1000);
+
+    return () => clearInterval(timerId);
+  }, [timeLeft, isAnswered, quizMode]);
+
+  // Handle timeout
+  useEffect(() => {
+    if (timeLeft === 0 && !isAnswered && quizMode === "quiz" && currentQuestion?.type !== "open_ended") {
+      setUserAnswers(prev => ({ ...prev, [currentQuestionIndex]: -1 }));
+      setIsAnswered(true);
+      toast({
+        title: language === "ar" ? "انتهى الوقت!" : "Time's up!",
+        description: language === "ar" ? "لم تقم بالإجابة في الوقت المحدد." : "You didn't answer in time.",
+        variant: "destructive",
+      });
+    }
+  }, [timeLeft, isAnswered, quizMode, currentQuestionIndex, currentQuestion, language, toast]);
 
   const handleOptionSelect = (index: number) => {
     if (isAnswered) return;
     setSelectedOption(index);
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (currentQuestion.type === "open_ended") {
       if (!userTextAnswer.trim()) return;
       setUserTextAnswers(prev => ({ ...prev, [currentQuestionIndex]: userTextAnswer }));
 
-      // Basic keyword matching logic
-      if (currentQuestion.expected_keywords && currentQuestion.expected_keywords.length > 0) {
-        const lowerAnswer = userTextAnswer.toLowerCase();
-        const matchedKeywords = currentQuestion.expected_keywords.filter(kw =>
-          lowerAnswer.includes(kw.toLowerCase())
+      setIsEvaluating(true);
+      try {
+        const evaluation = await evaluateEssayAnswer(
+          currentQuestion.text,
+          userTextAnswer,
+          currentQuestion.correct_answer || "",
+          currentQuestion.expected_keywords || [],
+          currentQuestion.numerical_answer || null
         );
+        setUserEssayEvaluations(prev => ({ ...prev, [currentQuestionIndex]: evaluation }));
 
-        // Award point if at least 50% of keywords are present
-        if (matchedKeywords.length >= Math.ceil(currentQuestion.expected_keywords.length / 2)) {
+        if (evaluation.isCorrect) {
           setScore(s => s + 1);
         }
+      } catch (err) {
+        console.error("Evaluation failed", err);
+        toast({
+          title: language === "ar" ? "خطأ في التقييم" : "Evaluation Error",
+          description: language === "ar" ? "تعذر تقييم إجابتك، يرجى المحاولة مرة أخرى." : "Could not evaluate your answer, please try again.",
+          variant: "destructive"
+        });
+      } finally {
+        setIsEvaluating(false);
+        setIsAnswered(true);
       }
     } else {
       if (selectedOption === null) return;
       const isCorrect = selectedOption === currentQuestion.correctIndex;
       if (isCorrect) setScore(s => s + 1);
       setUserAnswers(prev => ({ ...prev, [currentQuestionIndex]: selectedOption }));
+      setIsAnswered(true);
     }
-
-    setIsAnswered(true);
   };
 
   const ReferenceBadge = ({ reference }: { reference?: any }) => {
@@ -177,6 +225,7 @@ export function QuizView({ questions: initialQuestions, title = "Quiz", lectureI
     if (currentQuestionIndex < questions.length - 1) {
       setCurrentQuestionIndex(i => i + 1);
       setSelectedOption(null);
+      setUserTextAnswer("");
       setIsAnswered(false);
     } else {
       setQuizComplete(true);
@@ -187,20 +236,26 @@ export function QuizView({ questions: initialQuestions, title = "Quiz", lectureI
     setQuizMode("menu");
     setCurrentQuestionIndex(0);
     setSelectedOption(null);
+    setUserTextAnswer("");
     setIsAnswered(false);
     setScore(0);
     setQuizComplete(false);
     setUserAnswers({});
+    setUserTextAnswers({});
+    setUserEssayEvaluations({});
   };
 
   const handleStartQuiz = () => {
     setQuizMode("quiz");
     setCurrentQuestionIndex(0);
     setSelectedOption(null);
+    setUserTextAnswer("");
     setIsAnswered(false);
     setScore(0);
     setQuizComplete(false);
     setUserAnswers({});
+    setUserTextAnswers({});
+    setUserEssayEvaluations({});
   };
 
   const handleViewQuestions = () => {
@@ -265,12 +320,26 @@ export function QuizView({ questions: initialQuestions, title = "Quiz", lectureI
           `;
         }).join("");
 
-        const textAnswerHTML = q.type === "open_ended" && userTextAnswers[qIndex] ? `
-          <div style="margin-top: 10px; padding: 10px; border: 1px dashed ${primaryColor}; border-radius: 6px;">
-            <p style="font-size: 13px; color: ${darkTextColor}; margin-bottom: 5px;"><strong>${language === "ar" ? "إجابتك:" : "Your Answer:"}</strong></p>
-            <p style="font-size: 13px; font-style: italic;">${userTextAnswers[qIndex]}</p>
-          </div>
-        ` : "";
+        let textAnswerHTML = "";
+        if (q.type === "open_ended" && userTextAnswers[qIndex]) {
+          const evalData = userEssayEvaluations[qIndex];
+          textAnswerHTML = `
+            <div style="margin-top: 10px; padding: 10px; border: 1px dashed ${primaryColor}; border-radius: 6px;">
+              <p style="font-size: 13px; color: ${darkTextColor}; margin-bottom: 5px;"><strong>${language === "ar" ? "إجابتك:" : "Your Answer:"}</strong></p>
+              <p style="font-size: 13px; font-style: italic; margin-bottom: 10px;">${userTextAnswers[qIndex]}</p>
+              ${evalData ? `
+                <div style="margin-top: 10px; padding: 10px; background-color: ${evalData.isCorrect ? '#ECFDF5' : '#FEF2F2'}; border-radius: 4px; border-${hasArabic ? 'right' : 'left'}: 3px solid ${evalData.isCorrect ? correctColor : incorrectColor};">
+                  <p style="font-size: 12px; font-weight: bold; color: ${evalData.isCorrect ? correctColor : incorrectColor}; margin-bottom: 5px;">
+                    ${evalData.isCorrect ? (language === "ar" ? "إجابة مقبولة" : "Correct Answer") : (language === "ar" ? "تحتاج لتحسين" : "Needs Improvement")} 
+                    (${evalData.similarityScore}%)
+                  </p>
+                  <p style="font-size: 12px; color: ${darkTextColor}; margin-bottom: 5px;"><strong>${language === "ar" ? "التقييم:" : "Feedback:"}</strong> ${evalData.feedback}</p>
+                  <p style="font-size: 12px; color: ${darkTextColor};"><strong>${language === "ar" ? "الإجابة النموذجية:" : "Model Answer:"}</strong> ${evalData.correctAnswer}</p>
+                </div>
+              ` : ''}
+            </div>
+          `;
+        }
 
         const referenceHTML = q.reference ? `
           <div style="margin-top: 10px; font-size: 12px; color: ${mutedForeground};">
@@ -812,11 +881,51 @@ export function QuizView({ questions: initialQuestions, title = "Quiz", lectureI
                     })}
                   </div>
                 ) : (
-                  <div className="space-y-3">
-                    <p className="text-sm font-medium">{detectContentLanguage === "ar" ? "إجابتك المكتوبة:" : "Your written answer:"}</p>
-                    <div className="p-4 bg-muted/30 rounded-lg border whitespace-pre-wrap">
-                      {userTextAnswers[qIndex] || (detectContentLanguage === "ar" ? "لا توجد إجابة" : "No answer provided")}
+                  <div className="space-y-4">
+                    <div className="space-y-3">
+                      <p className="text-sm font-medium">{detectContentLanguage === "ar" ? "إجابتك المكتوبة:" : "Your written answer:"}</p>
+                      <div className="p-4 bg-muted/30 rounded-lg border whitespace-pre-wrap">
+                        {userTextAnswers[qIndex] || (detectContentLanguage === "ar" ? "لا توجد إجابة" : "No answer provided")}
+                      </div>
                     </div>
+
+                    {userEssayEvaluations[qIndex] && (() => {
+                      const evaluation = userEssayEvaluations[qIndex];
+                      const isSuccess = evaluation.isCorrect;
+                      return (
+                        <div className={cn(
+                          "p-4 rounded-lg border flex flex-col gap-3",
+                          isSuccess ? "bg-green-50 border-green-200 text-green-900" : "bg-red-50 border-red-200 text-red-900",
+                        )} dir={contentDir} style={{ textAlign: contentTextAlign }}>
+                          <div className={cn("flex items-center gap-3", contentDir === "rtl" ? "flex-row-reverse" : "")}>
+                            {isSuccess ? <CheckCircle className="w-6 h-6 shrink-0 text-green-600" /> : <XCircle className="w-6 h-6 shrink-0 text-red-600" />}
+                            <div>
+                              <p className="font-bold text-lg">
+                                {isSuccess
+                                  ? (detectContentLanguage === "ar" ? "إجابة مقبولة! (" + evaluation.similarityScore + "% تطابق)" : "Correct Answer! (" + evaluation.similarityScore + "% Match)")
+                                  : (detectContentLanguage === "ar" ? "إجابة تحتاج لتحسين (" + evaluation.similarityScore + "% تطابق)" : "Needs Improvement (" + evaluation.similarityScore + "% Match)")}
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="text-sm opacity-90 mt-2 bg-white/50 p-3 rounded-md">
+                            <p className="font-semibold mb-1 w-full flex items-center gap-1">
+                              <Sparkles className="w-4 h-4" />
+                              {detectContentLanguage === "ar" ? "التقييم والتحليل:" : "AI Feedback:"}
+                            </p>
+                            <p>{evaluation.feedback}</p>
+                          </div>
+
+                          <div className="text-sm opacity-90 bg-white/50 p-3 rounded-md">
+                            <p className="font-semibold mb-1 text-primary w-full flex items-center gap-1">
+                              <BookOpen className="w-4 h-4" />
+                              {detectContentLanguage === "ar" ? "الإجابة النموذجية:" : "Model Answer:"}
+                            </p>
+                            <p>{evaluation.correctAnswer}</p>
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                 )}
 
@@ -856,12 +965,22 @@ export function QuizView({ questions: initialQuestions, title = "Quiz", lectureI
 
         <Card className="border-2 shadow-sm overflow-hidden border-primary/20">
           <CardHeader className="bg-primary/5 pb-6">
-            <div className="flex items-center gap-2 mb-2">
+            <div className={`flex items-center justify-between gap-2 mb-2 ${contentDir === "rtl" ? "flex-row-reverse" : ""}`}>
               <Badge variant="secondary" className="text-[10px] font-bold uppercase tracking-wider px-1.5 h-5">
                 {currentQuestion.type === "open_ended"
                   ? (detectContentLanguage === "ar" ? "سؤال مقالي" : "OPEN ENDED")
                   : (detectContentLanguage === "ar" ? "خيار من متعدد" : "MULTIPLE CHOICE")}
               </Badge>
+              {timeLeft !== null && (
+                <div className={cn(
+                  "flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-bold shadow-sm transition-colors",
+                  timeLeft <= 10 ? "bg-red-100 text-red-700 animate-pulse" : "bg-primary/10 text-primary",
+                  contentDir === "rtl" ? "flex-row-reverse" : ""
+                )}>
+                  <Timer className="w-4 h-4" />
+                  <span className="w-5 text-center">{timeLeft}</span>
+                </div>
+              )}
             </div>
             <CardTitle
               className="text-xl leading-relaxed break-words"
@@ -885,66 +1004,50 @@ export function QuizView({ questions: initialQuestions, title = "Quiz", lectureI
                   style={{ textAlign: contentTextAlign }}
                 />
 
-                {isAnswered && (
+                {isAnswered && userEssayEvaluations[currentQuestionIndex] && (
                   <motion.div
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     className="space-y-4"
                   >
                     {(() => {
-                      const matchedCount = currentQuestion.expected_keywords?.filter(kw =>
-                        userTextAnswer.toLowerCase().includes(kw.toLowerCase())
-                      ).length || 0;
-                      const totalKeywords = currentQuestion.expected_keywords?.length || 1;
-                      const isSuccess = matchedCount >= Math.ceil(totalKeywords / 2);
+                      const evaluation = userEssayEvaluations[currentQuestionIndex];
+                      const isSuccess = evaluation.isCorrect;
 
                       return (
                         <div className={cn(
-                          "p-4 rounded-lg border flex items-center gap-3",
-                          isSuccess ? "bg-green-50 border-green-200 text-green-800" : "bg-red-50 border-red-200 text-red-800",
-                          contentDir === "rtl" ? "flex-row-reverse" : ""
-                        )}>
-                          {isSuccess ? <CheckCircle className="w-6 h-6 shrink-0" /> : <XCircle className="w-6 h-6 shrink-0" />}
-                          <div>
-                            <p className="font-bold text-lg">
-                              {isSuccess
-                                ? (detectContentLanguage === "ar" ? "إجابة مقبولة!" : "Correct Answer!")
-                                : (detectContentLanguage === "ar" ? "إجابة تحتاج لتحسين" : "Needs Improvement")}
+                          "p-4 rounded-lg border flex flex-col gap-3",
+                          isSuccess ? "bg-green-50 border-green-200 text-green-900" : "bg-red-50 border-red-200 text-red-900",
+                        )} dir={contentDir} style={{ textAlign: contentTextAlign }}>
+                          <div className={cn("flex items-center gap-3", contentDir === "rtl" ? "flex-row-reverse" : "")}>
+                            {isSuccess ? <CheckCircle className="w-6 h-6 shrink-0 text-green-600" /> : <XCircle className="w-6 h-6 shrink-0 text-red-600" />}
+                            <div>
+                              <p className="font-bold text-lg">
+                                {isSuccess
+                                  ? (detectContentLanguage === "ar" ? "إجابة مقبولة! (" + evaluation.similarityScore + "% تطابق)" : "Correct Answer! (" + evaluation.similarityScore + "% Match)")
+                                  : (detectContentLanguage === "ar" ? "إجابة تحتاج لتحسين (" + evaluation.similarityScore + "% تطابق)" : "Needs Improvement (" + evaluation.similarityScore + "% Match)")}
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="text-sm opacity-90 mt-2 bg-white/50 p-3 rounded-md">
+                            <p className="font-semibold mb-1 w-full flex items-center gap-1">
+                              <Sparkles className="w-4 h-4" />
+                              {detectContentLanguage === "ar" ? "التقييم والتحليل:" : "AI Feedback:"}
                             </p>
-                            <p className="text-sm opacity-90">
-                              {detectContentLanguage === "ar"
-                                ? `لقد ذكرت ${matchedCount} من ${totalKeywords} كلمات مفتاحية مطلوبة.`
-                                : `You mentioned ${matchedCount} out of ${totalKeywords} required keywords.`}
+                            <p>{evaluation.feedback}</p>
+                          </div>
+
+                          <div className="text-sm opacity-90 bg-white/50 p-3 rounded-md">
+                            <p className="font-semibold mb-1 text-primary w-full flex items-center gap-1">
+                              <BookOpen className="w-4 h-4" />
+                              {detectContentLanguage === "ar" ? "الإجابة النموذجية:" : "Model Answer:"}
                             </p>
+                            <p>{evaluation.correctAnswer}</p>
                           </div>
                         </div>
                       );
                     })()}
-
-                    <div className="p-4 bg-primary/5 rounded-lg border border-primary/10">
-                      <p className="text-sm font-bold text-primary mb-2 flex items-center gap-1.5">
-                        <HelpCircle className="w-4 h-4" />
-                        {detectContentLanguage === "ar" ? "الكلمات المفتاحية المطلوبة:" : "Required Keywords:"}
-                      </p>
-                      <div className="flex flex-wrap gap-2">
-                        {currentQuestion.expected_keywords?.map((keyword, i) => {
-                          const isMatched = userTextAnswer.toLowerCase().includes(keyword.toLowerCase());
-                          return (
-                            <Badge
-                              key={i}
-                              variant={isMatched ? "default" : "outline"}
-                              className={cn(
-                                "transition-all duration-300",
-                                isMatched ? "bg-green-500 hover:bg-green-600 text-white" : "bg-background opacity-70"
-                              )}
-                            >
-                              {keyword}
-                              {isMatched && <CheckCircle className="w-3 h-3 ml-1" />}
-                            </Badge>
-                          );
-                        })}
-                      </div>
-                    </div>
                   </motion.div>
                 )}
               </div>
@@ -1002,11 +1105,12 @@ export function QuizView({ questions: initialQuestions, title = "Quiz", lectureI
             {!isAnswered ? (
               <Button
                 onClick={handleSubmit}
-                disabled={currentQuestion.type === "open_ended" ? !userTextAnswer.trim() : selectedOption === null}
+                disabled={(currentQuestion.type === "open_ended" ? !userTextAnswer.trim() : selectedOption === null) || isEvaluating}
                 className="min-w-[140px] shadow-md hover:shadow-lg transition-all"
                 size="lg"
               >
-                {t.checkAnswer}
+                {isEvaluating ? <RotateCcw className="w-4 h-4 animate-spin mr-2" /> : null}
+                {isEvaluating ? (language === "ar" ? "جاري التقييم..." : "Evaluating...") : t.checkAnswer}
               </Button>
             ) : (
               <Button onClick={handleNext} className="min-w-[140px] shadow-md hover:shadow-lg transition-all" size="lg">

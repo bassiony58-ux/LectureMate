@@ -11,6 +11,7 @@ export interface Question {
   type: "multiple_choice" | "true_false" | "open_ended";
   is_numerical?: boolean;
   expected_keywords?: string[] | null;
+  numerical_answer?: string | number | null;
   reference?: {
     source_type: "uploaded_content" | "related_topic";
     location: string;
@@ -29,6 +30,14 @@ export interface Flashcard {
   id: number;
   term: string;
   definition: string;
+}
+
+export interface Formula {
+  id: number;
+  name: string;
+  formula: string;
+  description: string;
+  category?: string;
 }
 
 export type LectureCategory =
@@ -61,8 +70,13 @@ export interface Lecture {
   questions?: Question[]; // Legacy support
   slides?: Slide[];
   flashcards?: Flashcard[];
+  formulas?: Formula[];
   modelType?: "gpu" | "api"; // Model used to process this lecture
   category?: LectureCategory; // Smart category classification
+  geminiFileUri?: string; // Gemini Vision API file URI
+  geminiFileMimeType?: string; // Gemini Vision API file mime type
+  mindmap?: any; // AI generated mind map configuration
+  extractedImages?: { url: string; description: string; analyzed?: boolean }[]; // Array of extracted images
 }
 
 export const MOCK_LECTURES: Lecture[] = [

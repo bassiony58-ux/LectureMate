@@ -11,7 +11,7 @@ import { FeatureShowcase } from "@/components/home/FeatureShowcase";
 import { useAuth } from "@/contexts/AuthContext";
 import { useLectures } from "@/hooks/useLectures";
 import { extractVideoId, getYouTubeThumbnail, getYouTubeVideoInfo, getYouTubeTranscript, transcribeAudioFile, transcribeYouTubeWithWhisper } from "@/lib/youtubeService";
-import { generateSummary, generateQuiz, generateSlides, generateFlashcards } from "@/lib/aiService";
+import { generateSummary, generateQuiz, generateSlides, generateFlashcards, generateFormulas as extractMathFormulas, generateMindmap } from "@/lib/aiService";
 import { useToast } from "@/hooks/use-toast";
 import { useLanguage } from "@/contexts/LanguageContext";
 import { classifyLecture } from "@/lib/categoryClassifier";
@@ -360,11 +360,18 @@ export default function Home() {
       // and then have the server download it.
       // For now, let's stick to sending the file directly to the API as it's simpler.
 
-      const transcript = await transcribeAudioFile(file, whisperModel, undefined, device, lectureId);
+      const transcribeResult = await transcribeAudioFile(file, whisperModel, undefined, device, lectureId);
+
+      const transcript = typeof transcribeResult === 'string' ? transcribeResult : transcribeResult?.transcript;
+      const geminiFileUri = typeof transcribeResult === 'string' ? undefined : transcribeResult?.geminiFileUri;
+      const geminiFileMimeType = typeof transcribeResult === 'string' ? undefined : transcribeResult?.geminiFileMimeType;
+      const extractedImages = typeof transcribeResult === 'string' ? undefined : transcribeResult?.extractedImages;
 
       console.log(`[Home] Transcript received:`, {
         length: transcript?.length || 0,
-        preview: transcript?.substring(0, 100) || "empty"
+        preview: transcript?.substring(0, 100) || "empty",
+        hasGeminiVision: !!geminiFileUri,
+        hasImages: !!extractedImages && extractedImages.length > 0
       });
 
       if (!transcript || transcript.length === 0) {
@@ -378,7 +385,7 @@ export default function Home() {
       console.log(`[Home] Saving transcript to Firestore for lecture: ${lectureId}`);
       // Classify category using AI with transcript for better accuracy
       const category = await classifyLecture({ title: file.name, transcript }, selectedModel);
-      await updateLecture({ lectureId, updates: { progress: 40, transcript, category, modelType: selectedModel } });
+      await updateLecture({ lectureId, updates: { progress: 40, transcript, category, modelType: selectedModel, geminiFileUri, geminiFileMimeType, extractedImages } });
       console.log(`[Home] Transcript saved successfully with category: ${category}, modelType: ${selectedModel}`);
 
       console.log(`[Home] Starting sequential AI generation (Summary -> Quiz -> Slides -> Flashcards)...`);
@@ -388,9 +395,13 @@ export default function Home() {
       console.log(`[Home] Generating summary...`);
       const summary = await generateSummary(transcript, selectedModel);
       console.log(`[Home] Summary generated.`);
-      await updateLecture({ lectureId, updates: { progress: 60, summary } });
+      await updateLecture({ lectureId, updates: { progress: 55, summary } });
 
-      if (isProcessingStopped && processingLectureId === lectureId) return;
+      // 1.5 Generate Mind Map
+      console.log(`[Home] Generating mind map...`);
+      const mindmap = await generateMindmap(transcript, selectedModel);
+      console.log(`[Home] Mind map generated.`);
+      await updateLecture({ lectureId, updates: { progress: 65, mindmap } });
 
       // 2. Generate Quiz
       console.log(`[Home] Generating quiz...`);
@@ -401,9 +412,15 @@ export default function Home() {
       if (isProcessingStopped && processingLectureId === lectureId) return;
 
       // 3. Generate Slides
-      console.log(`[Home] Generating slides...`);
-      const slides = await generateSlides(transcript, summary);
-      console.log(`[Home] Slides generated.`);
+      const isPresentation = !!file.name.match(/\.(pptx?)$/i);
+      let slides: any[] = [];
+      if (!isPresentation) {
+        console.log(`[Home] Generating slides...`);
+        slides = await generateSlides(transcript, summary);
+        console.log(`[Home] Slides generated.`);
+      } else {
+        console.log(`[Home] Skipped slides generation for presentation file.`);
+      }
       await updateLecture({ lectureId, updates: { progress: 90, slides } });
 
       if (isProcessingStopped && processingLectureId === lectureId) return;
@@ -413,7 +430,14 @@ export default function Home() {
       const flashcards = await generateFlashcards(transcript, selectedModel);
       console.log(`[Home] Flashcards generated.`);
 
-      await updateLecture({ lectureId, updates: { progress: 100, flashcards, status: "completed", modelType: selectedModel } });
+      if (isProcessingStopped && processingLectureId === lectureId) return;
+
+      // 5. Extract Formulas
+      console.log(`[Home] Extracting math formulas...`);
+      let formulas = await extractMathFormulas(transcript, selectedModel, geminiFileUri, geminiFileMimeType);
+      console.log(`[Home] Math formulas extracted: ${formulas?.length || 0}`);
+
+      await updateLecture({ lectureId, updates: { progress: 100, flashcards, formulas, status: "completed", modelType: selectedModel } });
 
       setProcessingLectureId(null);
       setIsProcessingStopped(false);
@@ -492,12 +516,15 @@ export default function Home() {
       // For GPU model: use Whisper with GPU (cuda) and large-v3, fallback to CPU automatically if GPU not available
       // For API model: use YouTube transcript API
       let transcript: string | null = null;
+      let geminiFileUri: string | undefined;
+      let geminiFileMimeType: string | undefined;
+
       if (selectedModel === "gpu") {
         // LM-Titan: Use Whisper with GPU and large-v3
         const whisperModel = "large-v3"; // Always use best model
         const device = "cuda"; // Try GPU first, will fallback to CPU automatically if not available
         console.log(`[Home] Using Whisper to transcribe YouTube video: ${videoId} with GPU and ${whisperModel}`);
-        transcript = await transcribeYouTubeWithWhisper(
+        const transcribeResult = await transcribeYouTubeWithWhisper(
           videoId,
           whisperModel,
           undefined, // auto-detect language (will be set to 'ar' if Arabic detected)
@@ -509,6 +536,10 @@ export default function Home() {
           videoInfo?.channelName, // Pass channel name for language detection
           lectureId // Pass lecture ID for process tracking
         );
+
+        transcript = typeof transcribeResult === 'string' ? transcribeResult : transcribeResult?.transcript || null;
+        geminiFileUri = typeof transcribeResult === 'string' ? undefined : transcribeResult?.geminiFileUri;
+        geminiFileMimeType = typeof transcribeResult === 'string' ? undefined : transcribeResult?.geminiFileMimeType;
       } else {
         // LM-Cloud: Use YouTube transcript API
         console.log(`[Home] Calling getYouTubeTranscript for video: ${videoId}...`);
@@ -519,7 +550,8 @@ export default function Home() {
       console.log(`[Home] Transcript received:`, {
         length: transcript?.length || 0,
         preview: transcript?.substring(0, 100) || "empty",
-        method: selectedModel === "gpu" ? "Whisper" : "Transcript API"
+        method: selectedModel === "gpu" ? "Whisper" : "Transcript API",
+        hasGeminiVision: !!geminiFileUri
       });
 
       if (!transcript || transcript.length === 0) {
@@ -535,7 +567,7 @@ export default function Home() {
       console.log(`[Home] Classifying lecture...`);
       const category = await classifyLecture({ title: videoInfo?.title || "Untitled Lecture", transcript }, selectedModel);
       console.log(`[Home] Classification done: ${category}. Updating lecture in DB...`);
-      await updateLecture({ lectureId, updates: { progress: 40, transcript, category, modelType: selectedModel } });
+      await updateLecture({ lectureId, updates: { progress: 40, transcript, category, modelType: selectedModel, geminiFileUri, geminiFileMimeType } });
       console.log(`[Home] Transcript and category saved successfully.`);
 
       console.log(`[Home] Starting parallel AI generation (Summary, Quiz, Flashcards)...`);
@@ -543,15 +575,17 @@ export default function Home() {
 
       // Start independent tasks in parallel
       const summaryPromise = generateSummary(transcript, selectedModel);
+
       const quizPromise = generateQuiz(transcript, selectedModel);
       const flashcardsPromise = generateFlashcards(transcript, selectedModel);
+      const formulasPromise = extractMathFormulas(transcript, selectedModel, geminiFileUri, geminiFileMimeType);
 
       // 1. Wait for Summary (needed for slides)
       const summary = await summaryPromise;
       console.log(`[Home] Summary generated.`);
-      await updateLecture({ lectureId, updates: { progress: 60, summary } });
+      await updateLecture({ lectureId, updates: { progress: 55, summary } });
 
-      if (isProcessingStopped && processingLectureId === lectureId) return;
+
 
       // 2. Start Slides (depends on summary)
       console.log(`[Home] Generating slides...`);
@@ -567,15 +601,29 @@ export default function Home() {
       // 4. Wait for Slides
       const slides = await slidesPromise;
       console.log(`[Home] Slides generated.`);
-      await updateLecture({ lectureId, updates: { progress: 90, slides } });
+      await updateLecture({ lectureId, updates: { progress: 85, slides } });
+
+      // 4.5 Wait for Flashcards (Needed for Mindmap)
+      const flashcards = await flashcardsPromise;
+      console.log(`[Home] Flashcards generated.`);
+      await updateLecture({ lectureId, updates: { progress: 90, flashcards } });
 
       if (isProcessingStopped && processingLectureId === lectureId) return;
 
-      // 5. Wait for Flashcards
-      const flashcards = await flashcardsPromise;
-      console.log(`[Home] Flashcards generated.`);
+      // 5. Generate Mindmap from Flashcards
+      console.log(`[Home] Generating Mindmap...`);
+      const mindmap = await generateMindmap(transcript, selectedModel, flashcards);
+      console.log(`[Home] Mind map generated.`);
+      await updateLecture({ lectureId, updates: { progress: 95, mindmap } });
 
-      await updateLecture({ lectureId, updates: { progress: 100, flashcards, status: "completed", modelType: selectedModel } });
+      // 6. Wait for Formulas
+      const formulas = await formulasPromise;
+      console.log(`[Home] Math formulas extracted: ${formulas.length}`);
+
+      await updateLecture({
+        lectureId,
+        updates: { progress: 100, flashcards, formulas, status: "completed", modelType: selectedModel },
+      });
 
       setProcessingLectureId(null);
       setIsProcessingStopped(false);
