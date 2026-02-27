@@ -162,4 +162,50 @@ export async function downloadAudioFromFirebase(
   }
 }
 
+/**
+ * Upload image file to Firebase Storage
+ * @param filePath Local file path to upload
+ * @param userId User ID
+ * @param lectureId Lecture ID (for organizing files)
+ * @returns Download URL of uploaded file
+ */
+export async function uploadImageToFirebase(
+  filePath: string,
+  userId: string,
+  lectureId: string
+): Promise<string> {
+  if (!bucket) {
+    throw new Error("Firebase Storage is not initialized");
+  }
 
+  try {
+    const fileName = `images/${userId}/${lectureId}/${path.basename(filePath)}`;
+
+    console.log(`[Firebase Storage] Uploading image file: ${fileName}`);
+
+    const ext = path.extname(filePath).toLowerCase();
+    const contentType = ext === '.png' ? 'image/png' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
+
+    await bucket.upload(filePath, {
+      destination: fileName,
+      metadata: {
+        contentType: contentType,
+        cacheControl: "public, max-age=31536000",
+      },
+    });
+
+    // Make file publicly accessible
+    const file = bucket.file(fileName);
+    await file.makePublic();
+
+    // Get public URL
+    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+
+    console.log(`[Firebase Storage] Image uploaded successfully: ${publicUrl}`);
+
+    return publicUrl;
+  } catch (error: any) {
+    console.error("[Firebase Storage] Error uploading image:", error);
+    throw error;
+  }
+}

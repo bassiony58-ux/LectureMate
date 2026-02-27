@@ -5,14 +5,15 @@ import { exec, spawn, type ChildProcess } from "child_process";
 import { promisify } from "util";
 import path from "path";
 import { fileURLToPath } from "url";
-import { existsSync, unlinkSync, mkdirSync, readFileSync } from "fs";
+import { existsSync, unlinkSync, mkdirSync, readFileSync, copyFileSync } from "fs";
 import { createRequire } from "module";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { GoogleAIFileManager } from "@google/generative-ai/server";
 import pptxgen from "pptxgenjs";
 import multer from "multer";
 import os from "os";
-import { uploadAudioToFirebase, checkAudioExists, downloadAudioFromFirebase } from "./firebaseStorage";
+import { uploadAudioToFirebase, checkAudioExists, downloadAudioFromFirebase, uploadImageToFirebase } from "./firebaseStorage";
+import youtubedl from "youtube-dl-exec";
 const require = createRequire(import.meta.url);
 const pdf = require("pdf-parse");
 const mammoth = require("mammoth");
@@ -90,18 +91,33 @@ export async function registerRoutes(
   // put application routes here
   // prefix all routes with /api
 
+  // Serve the local uploads directory for fallback images when Firebase fails
+  const localImagesDir = path.join(process.cwd(), "uploads", "images");
+  if (!existsSync(localImagesDir)) {
+    mkdirSync(localImagesDir, { recursive: true });
+  }
+  const expressModule = require("express");
+  app.use("/uploads", expressModule.static(path.join(process.cwd(), "uploads")));
+
   // Helper for Gemini requests with retry logic and model fallback
-  const callGeminiWithRetry = async (genAI: any, prompt: string, preferredModel = "gemini-2.5-flash", retries = 3) => {
+  const callGeminiWithRetry = async (genAI: any, prompt: string | any[], preferredModel = "gemini-2.5-flash", retries = 3, temperature?: number, responseMimeType?: string) => {
     // Models to try in order of preference (fallback strategy)
-    const modelsToTry = ["gemini-2.5-flash"];
+    const modelsToTry = [preferredModel, "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"];
     let lastError: any;
 
+    let currentModelIndex = 0;
+
     for (let i = 0; i < retries; i++) {
-      // Rotate through models if retry occurs (in this case only one model)
-      const modelName = modelsToTry[0];
+      // Try next model if previous one hard failed
+      if (currentModelIndex >= modelsToTry.length) currentModelIndex = 0;
+      const modelName = modelsToTry[currentModelIndex];
       try {
-        console.log(`[API] Attempting with model: ${modelName} (Attempt ${i + 1}/${retries})`);
-        const model = genAI.getGenerativeModel({ model: modelName });
+        console.log(`[API] Attempting with model: ${modelName} (Attempt ${i + 1}/${retries}), Temp: ${temperature ?? 'default'}`);
+        const config: any = temperature !== undefined ? { temperature } : {};
+        if (responseMimeType) {
+          config.responseMimeType = responseMimeType;
+        }
+        const model = genAI.getGenerativeModel({ model: modelName, generationConfig: config });
         const result = await model.generateContent(prompt);
         const response = await result.response;
         return response.text().trim();
@@ -118,7 +134,12 @@ export async function registerRoutes(
 
         // Handle 404 or other failures by switching model immediately
         console.error(`[API] Gemini Error with ${modelName}:`, error.message);
-        console.log(`[API] Retrying with same model...`);
+        currentModelIndex++;
+        if (currentModelIndex < modelsToTry.length) {
+          console.log(`[API] Falling back to model: ${modelsToTry[currentModelIndex]}...`);
+        } else {
+          console.log(`[API] Retrying with same model...`);
+        }
         continue;
       }
     }
@@ -460,103 +481,62 @@ export async function registerRoutes(
         const pythonExecutable = process.platform === "win32" ? "python" : "python3";
         const pythonCmd = process.env.PYTHON_CMD || (existsSync(venvPython) ? venvPython : pythonExecutable);
 
-        // Step 1: Download audio from YouTube (if not found in Firebase)
+        let geminiFileUri: string | undefined;
+        let geminiFileMimeType: string | undefined;
+
+        // Step 1: Download video from YouTube (if not found in Firebase)
         if (!downloadedFilePath) {
-          const downloadScript = path.join(__dirname, "scripts", "download_youtube_audio.py");
+          const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+          downloadedFilePath = path.join(os.tmpdir(), `youtube-vid-${videoId}-${Date.now()}.mp4`);
 
-          const downloadArgs = [downloadScript, videoId];
-          if (startTimeSeconds !== null) {
-            downloadArgs.push(startTimeSeconds.toString());
-          } else {
-            downloadArgs.push("None");
-          }
-          if (endTimeSeconds !== null) {
-            downloadArgs.push(endTimeSeconds.toString());
-          } else {
-            downloadArgs.push("None");
-          }
+          console.log(`[API] Downloading YouTube video using youtube-dl-exec for Vision processing...`);
 
-          console.log(`[API] Downloading audio from YouTube...`);
+          const dlOptions: any = {
+            format: 'best[height<=720]/best',
+            output: downloadedFilePath,
+            noCheckCertificates: true,
+            noWarnings: true,
+            preferFreeFormats: true,
+          };
 
-          // Use spawn to track the process
-          downloadProcess = spawn(pythonCmd, downloadArgs, {
-            stdio: ['ignore', 'pipe', 'pipe']
-          });
-
-          // Track process if lectureId is provided
-          if (lectureId) {
-            if (!activeProcesses.has(lectureId)) {
-              activeProcesses.set(lectureId, []);
-            }
-            activeProcesses.get(lectureId)!.push({
-              process: downloadProcess,
-              type: "download",
-              startTime: new Date()
-            });
+          if (startTimeSeconds !== null || endTimeSeconds !== null) {
+            const startStr = startTimeSeconds !== null ? startTimeSeconds.toString() : '0';
+            const endStr = endTimeSeconds !== null ? endTimeSeconds.toString() : 'inf';
+            dlOptions.downloadSections = `*${startStr}-${endStr}`;
           }
 
-          let downloadStdout = '';
-          let downloadStderr = '';
+          try {
+            await youtubedl(videoUrl, dlOptions);
+            console.log(`[API] Video downloaded successfully to ${downloadedFilePath}`);
 
-          downloadProcess.stdout?.on('data', (data) => {
-            downloadStdout += data.toString();
-          });
-
-          downloadProcess.stderr?.on('data', (data) => {
-            downloadStderr += data.toString();
-          });
-
-          // Wait for download to complete
-          await new Promise<void>((resolve, reject) => {
-            downloadProcess!.on('close', (code) => {
-              if (code !== 0) {
-                reject(new Error(`Download process exited with code ${code}. ${downloadStderr}`));
-              } else {
-                resolve();
-              }
-            });
-
-            downloadProcess!.on('error', (error) => {
-              reject(error);
-            });
-          });
-
-          if (downloadStderr) {
-            console.error(`[API] Python stderr (download):`, downloadStderr);
-          }
-
-          const downloadResult = JSON.parse(downloadStdout.trim());
-
-          // Remove download process from tracking
-          if (lectureId && downloadProcess) {
-            const processes = activeProcesses.get(lectureId);
-            if (processes) {
-              const index = processes.findIndex(p => p.process === downloadProcess);
-              if (index !== -1) {
-                processes.splice(index, 1);
+            // Optionally upload to Firebase Storage if no time range
+            if (startTimeSeconds === null && endTimeSeconds === null && userId !== "anonymous") {
+              try {
+                audioUrl = await uploadAudioToFirebase(downloadedFilePath, userId as string, videoId as string);
+                console.log(`[API] Media uploaded to Firebase Storage: ${audioUrl}`);
+              } catch (uploadError) {
+                console.warn(`[API] Could not upload to Firebase Storage (acceptable):`, uploadError);
               }
             }
-          }
-
-          if (!downloadResult.success) {
+          } catch (dlError: any) {
+            console.error(`[API] youtube-dl-exec failed:`, dlError);
             return res.status(500).json({
-              error: downloadResult.error || "Failed to download audio from YouTube",
-              details: downloadResult.details || "Could not download audio file.",
+              error: "Failed to download media from YouTube",
+              details: dlError.message || "Could not download file.",
             });
           }
+        }
 
-          downloadedFilePath = downloadResult.filePath;
-          console.log(`[API] Audio downloaded successfully: ${downloadedFilePath} (${(downloadResult.fileSize / 1024 / 1024).toFixed(2)} MB)`);
-
-          // Upload to Firebase Storage (only if no time range specified)
-          if (startTimeSeconds === null && endTimeSeconds === null && userId !== "anonymous" && downloadedFilePath && typeof downloadedFilePath === "string") {
-            try {
-              audioUrl = await uploadAudioToFirebase(downloadedFilePath, userId as string, videoId as string);
-              console.log(`[API] Audio uploaded to Firebase Storage: ${audioUrl}`);
-            } catch (uploadError) {
-              console.warn(`[API] Could not upload to Firebase Storage:`, uploadError);
-              // Continue even if upload fails
-            }
+        // Upload to Gemini for Vision API (optional but highly recommended for math)
+        if (process.env.GEMINI_API_KEY && existsSync(downloadedFilePath)) {
+          try {
+            console.log(`[API] Proactively uploading YouTube video to Gemini for future Vision tasks...`);
+            const fileRecord = await uploadToGemini(downloadedFilePath, "video/mp4");
+            geminiFileUri = fileRecord.uri;
+            geminiFileMimeType = fileRecord.mimeType;
+            console.log(`[API] YouTube video uploaded to Gemini: ${geminiFileUri}`);
+          } catch (uploadError) {
+            console.warn("[API] Proactive YouTube upload to Gemini failed, continuing without Vision support:", uploadError);
           }
         }
 
@@ -662,6 +642,8 @@ export async function registerRoutes(
           characterCount: transcribeResult.characterCount || transcript.length,
           language: transcribeResult.language,
           audioUrl: audioUrl || undefined, // Include Firebase Storage URL if available
+          geminiFileUri,
+          geminiFileMimeType,
         });
       } catch (pythonError: any) {
         // Remove processes from tracking on error
@@ -744,6 +726,7 @@ export async function registerRoutes(
    */
   app.post("/api/audio/transcribe", upload.single("audio"), async (req: Request, res: Response) => {
     let uploadedFilePath: string | null = null;
+    let originalFilename: string = "unknown";
     let childProcess: ChildProcess | null = null;
     const lectureId = req.body.lectureId as string | undefined;
 
@@ -753,6 +736,33 @@ export async function registerRoutes(
       }
 
       uploadedFilePath = req.file.path;
+      originalFilename = req.file.originalname;
+
+      let geminiFileUri: string | undefined;
+      let geminiFileMimeType: string | undefined;
+
+      // We no longer convert PPT to PDF because Gemini 1.5 natively supports PPTX files
+      // and we can extract images via zipfile locally if needed.
+
+      const isVideoInfo = req.file?.mimetype?.startsWith("video/") || originalFilename.match(/\.(mp4|webm|ogg|mov)$/i);
+      const isDocumentInfo = req.file?.mimetype === "application/pdf" || originalFilename.match(/\.(pdf|pptx?)$/i);
+      const isVisualFile = isVideoInfo || isDocumentInfo;
+
+      if (isVisualFile && process.env.GEMINI_API_KEY && existsSync(uploadedFilePath)) {
+        try {
+          console.log(`[API] Proactively uploading visual file ${originalFilename} to Gemini for future Vision tasks...`);
+          // Note: Gemini natively supports PDFs and PPTXs.
+          let mimeType = req.file?.mimetype || "video/mp4";
+          if (originalFilename.match(/\.pptx$/i)) mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+          if (originalFilename.match(/\.pdf$/i)) mimeType = "application/pdf";
+
+          const fileRecord = await uploadToGemini(uploadedFilePath, mimeType);
+          geminiFileUri = fileRecord.uri;
+          geminiFileMimeType = fileRecord.mimeType;
+        } catch (uploadError) {
+          console.warn("[API] Proactive upload to Gemini failed, continuing without Vision formulas support:", uploadError);
+        }
+      }
 
       // Extract parameters from FormData (multer puts them in req.body)
       // Default to large-v3 for best quality (especially on GPU/RunPod)
@@ -774,16 +784,76 @@ export async function registerRoutes(
         lectureId: lectureId || "none"
       });
 
-      console.log(`[API] Processing file: ${req.file.originalname} (${req.file.size} bytes)`);
+      console.log(`[API] Processing file: ${originalFilename} (original size: ${req.file.size} bytes)`);
 
-      const fileExt = path.extname(req.file.originalname).toLowerCase();
+      const fileExt = path.extname(originalFilename).toLowerCase();
       let transcript = "";
 
       // Handle Document Files
+      let extractedImages: { url: string, description: string }[] = [];
+
       if (fileExt === ".pdf") {
-        const dataBuffer = readFileSync(uploadedFilePath);
-        const data = await pdf(dataBuffer);
-        transcript = data.text;
+        try {
+          const venvPython = path.join(__dirname, "..", "venv", "bin", "python3");
+          const pythonExecutable = process.platform === "win32" ? "python" : "python3";
+          const pythonCmd = process.env.PYTHON_CMD || (existsSync(venvPython) ? venvPython : pythonExecutable);
+          const extractPdfScript = path.join(__dirname, "scripts", "extract_pdf_content.py");
+
+          console.log(`[API] Executing: ${pythonCmd} ${extractPdfScript} ${uploadedFilePath}`);
+          const { stdout, stderr } = await execAsync(`"${pythonCmd}" "${extractPdfScript}" "${uploadedFilePath}"`);
+
+          if (stderr) {
+            console.error(`[API] Python stderr (PDF extraction):`, stderr);
+          }
+
+          let result;
+          try {
+            // To handle potential encoding issues or extra print statements from python
+            let cleanStdout = stdout.substring(stdout.indexOf('{'));
+            result = JSON.parse(cleanStdout);
+          } catch (e) {
+            console.error("[API] Failed to parse PyMuPDF output:", stdout);
+            throw new Error("Invalid output from PyMuPDF script");
+          }
+
+          if (!result.success) {
+            throw new Error(`PDF extraction failed: ${result.error}`);
+          }
+
+          transcript = result.transcript;
+
+          // Upload extracted images to Firebase Storage
+          if (result.images && result.images.length > 0 && lectureId) {
+            const userId = req.body.userId || (req as any).user?.uid || "anonymous";
+            console.log(`[API] Uploading ${result.images.length} extracted images to Firebase (with local fallback)...`);
+            for (const imgPath of result.images) {
+              try {
+                const url = await uploadImageToFirebase(imgPath, userId, lectureId);
+                extractedImages.push({ url, description: "" });
+              } catch (err) {
+                console.warn(`[API] Firebase upload failed, falling back to local storage for image ${imgPath}:`, err);
+                try {
+                  const fileName = path.basename(imgPath);
+                  const localDest = path.join(process.cwd(), "uploads", "images", fileName);
+                  copyFileSync(imgPath, localDest);
+                  extractedImages.push({ url: `/uploads/images/${fileName}`, description: "" });
+                } catch (fallbackErr) {
+                  console.error(`[API] Local fallback failed for image ${imgPath}:`, fallbackErr);
+                }
+              }
+              // Clean up temp image file
+              if (existsSync(imgPath)) unlinkSync(imgPath);
+            }
+          }
+
+          if (!transcript || transcript.trim().length < 50) {
+            console.log(`[API] PDF text is empty or too short. Escalating to Gemini PDF extraction.`);
+            throw new Error("PDF text too short or empty for standard parsing");
+          }
+        } catch (err) {
+          console.log(`[API] PyMuPDF failed or returned little text. Escalating to Gemini PDF extraction.`);
+          throw err;
+        }
       } else if (fileExt === ".docx" || fileExt === ".doc") {
         const result = await mammoth.extractRawText({ path: uploadedFilePath });
         transcript = result.value;
@@ -796,7 +866,6 @@ export async function registerRoutes(
             });
           });
 
-          // Helper to extract text recursively from officeparser output
           const extractText = (obj: any): string => {
             if (!obj) return "";
             if (typeof obj === "string") return obj;
@@ -805,7 +874,6 @@ export async function registerRoutes(
             let text = "";
             if (obj.text) text += obj.text + "\n";
 
-            // Check children or content arrays
             if (obj.children) text += extractText(obj.children);
             if (obj.content) text += extractText(obj.content);
             if (obj.data) text += extractText(obj.data);
@@ -814,13 +882,52 @@ export async function registerRoutes(
           };
 
           transcript = typeof data === 'string' ? data : extractText(data);
+          transcript = transcript.replace(/\\n/g, "\n").replace(/\s+/g, " ").trim();
 
-          // Clean up the transcript (remove extra newlines and JSON artifacts)
-          transcript = transcript
-            .replace(/\\n/g, "\n")
-            .replace(/\s+/g, " ")
-            .trim();
+          // We ALSO extract images from PPTX using our new lightweight python zip extractor
+          if (fileExt === ".pptx" && lectureId) {
+            try {
+              const venvPython = path.join(__dirname, "..", "venv", "bin", "python3");
+              const pythonExecutable = process.platform === "win32" ? "python" : "python3";
+              const pythonCmd = process.env.PYTHON_CMD || (existsSync(venvPython) ? venvPython : pythonExecutable);
+              const pptxImagesScript = path.join(__dirname, "scripts", "extract_pptx_images.py");
 
+              console.log(`[API] Executing: ${pythonCmd} ${pptxImagesScript} for images...`);
+              const { stdout, stderr } = await execAsync(`"${pythonCmd}" "${pptxImagesScript}" "${uploadedFilePath}"`);
+
+              if (stderr) console.warn(`[API] extract_pptx_images stderr:`, stderr);
+              console.log(`[API] extract_pptx_images stdout:`, stdout);
+
+              let cleanStdout = stdout.indexOf('{') >= 0 ? stdout.substring(stdout.indexOf('{')) : stdout;
+              let result = JSON.parse(cleanStdout);
+
+              if (result.success && result.images && result.images.length > 0) {
+                const userId = req.body.userId || (req as any).user?.uid || "anonymous";
+                console.log(`[API] Uploading ${result.images.length} extracted PPTX images to Firebase (with local fallback)...`);
+                for (const imgPath of result.images) {
+                  try {
+                    const url = await uploadImageToFirebase(imgPath, userId, lectureId);
+                    extractedImages.push({ url, description: "" });
+                  } catch (err) {
+                    console.warn(`[API] Firebase upload failed, falling back to local storage for PPTX image ${imgPath}:`, err);
+                    try {
+                      const fileName = path.basename(imgPath);
+                      const localDest = path.join(process.cwd(), "uploads", "images", fileName);
+                      copyFileSync(imgPath, localDest);
+                      extractedImages.push({ url: `/uploads/images/${fileName}`, description: "" });
+                    } catch (fallbackErr) {
+                      console.error(`[API] Local fallback failed for PPTX image ${imgPath}:`, fallbackErr);
+                    }
+                  }
+                  if (existsSync(imgPath)) unlinkSync(imgPath);
+                }
+              } else {
+                console.log(`[API] extraction returned no images or false success. Result:`, result);
+              }
+            } catch (err: any) {
+              console.warn(`[API] Could not extract images from PPTX (non-fatal):`, err.message);
+            }
+          }
         } catch (err) {
           console.error("[API] Error parsing PPTX:", err);
           transcript = "";
@@ -828,26 +935,31 @@ export async function registerRoutes(
       }
 
       if (transcript && typeof transcript === 'string' && transcript.length > 0) {
-        console.log(`[API] Successfully extracted text from document: ${req.file.originalname} (${transcript.length} chars)`);
+        console.log(`[API] Successfully extracted text from document: ${originalFilename} (${transcript.length} chars)`);
         return res.json({
           transcript,
           wordCount: transcript.split(/\s+/).length,
           characterCount: transcript.length,
           language: "auto",
+          geminiFileUri,
+          geminiFileMimeType,
+          extractedImages: extractedImages.length > 0 ? extractedImages : undefined,
         });
       } else if (transcript) {
-        // Fallback for non-empty string but weird content
-        console.log(`[API] Extracted data from document: ${req.file.originalname}`);
+        console.log(`[API] Extracted data from document: ${originalFilename}`);
         return res.json({
           transcript: String(transcript),
           wordCount: 0,
           characterCount: 0,
           language: "auto",
+          geminiFileUri,
+          geminiFileMimeType,
+          extractedImages: extractedImages.length > 0 ? extractedImages : undefined,
         });
       }
 
       // If not a document, proceed with audio transcription (Whisper)
-      console.log(`[API] Proceeding with Whisper transcription for: ${req.file.originalname}`);
+      console.log(`[API] Proceeding with Whisper transcription for: ${originalFilename}`);
 
       // Extract parameters from FormData (multer puts them in req.body)
       const pythonScript = path.join(__dirname, "scripts", "transcribe_audio.py");
@@ -969,18 +1081,21 @@ export async function registerRoutes(
         wordCount: result.wordCount,
         characterCount: result.characterCount || audioTranscript.length,
         language: result.language,
+        geminiFileUri,
+        geminiFileMimeType,
       });
 
     } catch (error: any) {
-      // Check if we should try visual extraction for video files
-      // This happens if Whisper failed OR if we catch an error
-      const isVideo = req.file?.mimetype?.startsWith("video/") || req.file?.originalname.match(/\.(mp4|webm|ogg|mov)$/i);
+      // Check if we should try visual extraction for video/PDF files
+      // This happens if Whisper/pdf-parse failed OR if we catch an error
+      const isVideo = req.file?.mimetype?.startsWith("video/") || originalFilename.match(/\.(mp4|webm|ogg|mov)$/i);
+      const isPdf = req.file?.mimetype === "application/pdf" || originalFilename.match(/\.pdf$/i);
 
-      if (isVideo && process.env.GEMINI_API_KEY) {
-        console.log(`[API] Audio transcription failed or irrelevant. Attempting Visual Extraction via Gemini...`);
+      if ((isVideo || isPdf) && process.env.GEMINI_API_KEY) {
+        console.log(`[API] Audio/Doc translation failed or irrelevant. Attempting Visual Extraction via Gemini...`);
         try {
           // Use the file we already have (uploadedFilePath)
-          const mimeType = req.file?.mimetype || "video/mp4";
+          const mimeType = isPdf ? "application/pdf" : (req.file?.mimetype || "video/mp4");
 
           if (!uploadedFilePath || !existsSync(uploadedFilePath)) {
             throw new Error("File not found for visual extraction");
@@ -989,16 +1104,27 @@ export async function registerRoutes(
           const fileRecord = await uploadToGemini(uploadedFilePath, mimeType);
 
           const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-          const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+          // Use the same model as the rest of the application
+          const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-          const prompt = `You are an expert transcriber. The audio in this video might be silent, missing, or unclear. 
-          Your task:
-          1. Extract all VISIBLE text from the slides, whiteboard, or screen.
-          2. Describe any meaningful diagrams, charts, or visual actions that explain the concepts.
-          3. If there is any audible speech, include that as well.
-          4. Combine everything into a comprehensive, coherent lecture transcript.
-          5. Do NOT confuse this with a summary. I need the raw content/information acting as a transcript.
-          `;
+          const prompt = isPdf
+            ? `You are an expert document transcriber and analyzer.
+            Your task:
+            1. Extract all text from this document accurately and in its natural reading order.
+            2. For any meaningful diagrams, charts, or images, describe them naturally within the flow of the text, without using explicit labels like "Diagram Description".
+            3. *MATHEMATICS & FORMULAS*: Carefully extract all mathematical equations, formulas, physical laws, and scientific notations using standard LaTeX format (e.g., $inline$ or $$block$$). Interweave them seamlessly into the text just as they appear in the document.
+            4. CRITICAL: DO NOT use explicit headers or labels such as "Text:", "Mathematics & Formulas:", or "Diagram Description:". The final output must read smoothly and continuously like a textbook or a cohesive lecture transcript.
+            
+            Important: Output ONLY the combined transcript text. Do not add any introductory or concluding remarks.`
+            : `You are an expert transcriber. The audio in this video might be silent, missing, or unclear. 
+            Your task:
+            1. Extract all VISIBLE text from the slides, whiteboard, or screen.
+            2. Describe any meaningful diagrams, charts, or visual actions that explain the concepts.
+            3. If there is any audible speech, include that as well.
+            4. Combine everything into a comprehensive, coherent lecture transcript.
+            
+            Important: Output ONLY the combined transcript text, do not add introductory remarks.`;
+
 
           const result = await model.generateContent([
             prompt,
@@ -1019,7 +1145,9 @@ export async function registerRoutes(
             wordCount: visualTranscript.split(/\s+/).length,
             characterCount: visualTranscript.length,
             language: "auto",
-            method: "visual_extraction"
+            method: "visual_extraction",
+            geminiFileUri: fileRecord.uri,
+            geminiFileMimeType: fileRecord.mimeType,
           });
 
         } catch (visualError: any) {
@@ -1064,6 +1192,130 @@ export async function registerRoutes(
         } catch (cleanupError) {
           console.error(`[API] Error cleaning up file: ${cleanupError}`);
         }
+      }
+    }
+  });
+
+  /**
+   * AI Chat Agent endpoint
+   * POST /api/ai/chat
+   */
+  app.post("/api/ai/chat", async (req: Request, res: Response) => {
+    try {
+      const { transcript, message, history, mode } = req.body;
+      const isGpuMode = mode === "gpu";
+
+      console.log(`[API] Chat endpoint hit with mode: ${mode}`);
+      if (!transcript || typeof transcript !== "string") {
+        return res.status(400).json({ error: "Transcript is required" });
+      }
+      if (!message || typeof message !== "string") {
+        return res.status(400).json({ error: "Message is required" });
+      }
+
+      const geminiApiKey = process.env.GEMINI_API_KEY;
+      if (geminiApiKey && !isGpuMode) {
+        // Helper to get Gemini response for chat
+        const getChatResponse = async (transcript: string, message: string, history: any[]) => {
+          const genAI = new GoogleGenerativeAI(geminiApiKey);
+          // models to try in order of stability and performance
+          const models = ["gemini-2.5-flash"];
+          let lastErr;
+
+          for (const modelName of models) {
+            try {
+              console.log(`[API] Attempting chat with model: ${modelName}`);
+
+              const systemPrompt = `You are a highly efficient academic assistant and an expert in the broad field or discipline discussed in the provided transcript.
+                    
+                    ## CONTEXT AND SCOPE RULE:
+                    - First, identify the general field of the transcript (e.g., Programming, Mathematics, Physics, History, etc.).
+                    - You MUST answer ANY question the user asks as long as it falls within this general field or discipline, even if the specific topic was never mentioned in the lecture.
+                    - EXTERNAL KNOWLEDGE IS HIGHLY ENCOURAGED. Act as an expert tutor for this entire discipline.
+                    - Example 1: If the lecture is about "Python Variables", you CAN and SHOULD answer questions about "Java Arrays", "Web Development", or "Algorithms" because they are in the same broad field of Computer Science/Programming.
+                    - Example 2: If the lecture is about "Algebra", you CAN answer questions about "Calculus" or "Geometry".
+                    - ONLY decline completely unrelated, non-academic topics (like asking about sports, pop culture, random trivia, etc.) that have absolutely zero connection to the lecture's broad academic field. When declining, do so politely.
+
+
+                    ## STRICT LANGUAGE RULE:
+                    - You MUST detect the language of the user's message and respond in that EXACT SAME LANGUAGE. (Arabic -> Arabic, English -> English).
+                    - NEVER mix languages unless asked.
+
+                    ## CODE RENDERING:
+                    - You MUST ALWAYS wrap code snippets in markdown code blocks with the correct language tag (e.g., \`\`\`python, \`\`\`javascript) to ensure it is colored properly. 
+                    - Avoid plain text code blocks; always specify the language.
+
+                    ## MATHEMATICAL RENDERING:
+                    - Use LaTeX for ALL formulas: $inline$ and $$block$$.
+                    - Always provide the full law when asked.
+
+                    TRANSCRIPT CONTEXT:
+                    ${transcript.substring(0, 10000)}
+                    `;
+
+              const model = genAI.getGenerativeModel({
+                model: modelName,
+                systemInstruction: systemPrompt
+              });
+
+              // Clean history: must alternate user/model and start with user
+              const rawHistory = (history || [])
+                .filter(h => h.content && typeof h.content === 'string' && h.content.trim().length > 0)
+                .map(h => ({
+                  role: (h.role === "ai" || h.role === "model" ? "model" : "user") as "model" | "user",
+                  parts: [{ text: String(h.content) }]
+                }));
+
+              const cleanHistory: any[] = [];
+              let lastRole: string | null = null;
+
+              for (const entry of rawHistory) {
+                if (entry.role !== lastRole) {
+                  cleanHistory.push(entry);
+                  lastRole = entry.role;
+                }
+              }
+
+              // Ensure it starts with 'user'
+              if (cleanHistory.length > 0 && cleanHistory[0].role !== "user") {
+                cleanHistory.shift();
+              }
+
+              const chat = model.startChat({
+                history: cleanHistory,
+                generationConfig: {
+                  maxOutputTokens: 2048,
+                  temperature: 0.7,
+                }
+              });
+
+              const result = await chat.sendMessage(message);
+              return result.response.text();
+            } catch (err: any) {
+              console.error(`[API] Model ${modelName} failed:`, err.message || err);
+              lastErr = err;
+              // Continue to next model
+              continue;
+            }
+          }
+          throw lastErr;
+        };
+
+        try {
+          const reply = await getChatResponse(transcript, message, history || []);
+          return res.json({ reply });
+        } catch (chatError: any) {
+          console.error("[API] All chat models failed:", chatError);
+          return res.status(500).json({ error: "AI failed to respond. Please try again later." });
+        }
+      }
+
+      // Fallback
+      return res.status(500).json({ error: "Gemini API key not found or GPU mode not supported yet for chat" });
+    } catch (error: any) {
+      console.error("[API] Error in chat:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Failed to get AI response" });
       }
     }
   });
@@ -1120,18 +1372,53 @@ export async function registerRoutes(
           }
           Transcript: ${transcript.substring(0, 25000)}`;
 
-          const aiResponseRaw = await callGeminiWithRetry(genAI, unifiedPrompt, "gemini-2.5-flash");
+          const aiResponseRaw = await callGeminiWithRetry(genAI, unifiedPrompt, "gemini-2.5-flash", 3, undefined, "application/json");
 
           let parsed;
-          try {
-            const cleaned = aiResponseRaw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-            parsed = JSON.parse(cleaned);
-          } catch (e) {
-            console.warn("[API] Failed to parse unified summary JSON, using raw text as fallback");
-            return res.json({ summary: aiResponseRaw });
+          let cleaned = aiResponseRaw.replace(/```json\n?/gi, "").replace(/```\n?/g, "").trim();
+          const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            cleaned = jsonMatch[0];
           }
 
-          const combinedSummary = `### ${headingIntro}\n${parsed.introduction}\n\n### ${headingSummary}\n${parsed.summary}\n\n### ${headingPoints}\n${parsed.keypoints.map((p: string) => `- ${p}`).join("\n")}`;
+          try {
+            // Remove invalid escapes (like \ت) replacing it with ت
+            const strictCleaned = cleaned.replace(/\\([^"\\/bfnrtu])/g, '$1');
+            parsed = JSON.parse(strictCleaned);
+          } catch (e) {
+            console.warn("[API] Failed to parse unified summary JSON, using regex fallback");
+
+            // Regex fallback
+            const extractField = (fieldName: string) => {
+              const match = cleaned.match(new RegExp(`"${fieldName}"\\s*:\\s*(?:\\[(.*?)\\]|"([^"]*)")`, "is"));
+              if (match) {
+                if (match[1] !== undefined) {
+                  const arrMatch = match[1].match(/"([^"]*)"/g);
+                  return arrMatch ? arrMatch.map((s: string) => s.replace(/^"|"$/g, "").replace(/\\n/g, "\n")) : [];
+                }
+                return match[2] !== undefined ? match[2].replace(/\\n/g, "\n") : null;
+              }
+              return null;
+            };
+
+            const intro = extractField("introduction");
+            const summ = extractField("summary");
+            const kp = extractField("keypoints");
+
+            if (!intro && !summ && (!kp || kp.length === 0)) {
+              parsed = { introduction: "", summary: cleaned, keypoints: [] };
+            } else {
+              parsed = {
+                introduction: typeof intro === "string" ? intro : "",
+                summary: typeof summ === "string" ? summ : "",
+                keypoints: Array.isArray(kp) ? kp : []
+              };
+            }
+          }
+
+          const introSection = parsed.introduction ? `### ${headingIntro}\n${parsed.introduction}\n\n` : "";
+          const keypointsSection = parsed.keypoints && parsed.keypoints.length > 0 ? `\n\n### ${headingPoints}\n${parsed.keypoints.map((p: string) => `- ${p}`).join("\n")}` : "";
+          const combinedSummary = `${introSection}### ${headingSummary}\n${parsed.summary}${keypointsSection}`;
 
           console.log(`[API] Gemini unified summary generated (${combinedSummary.length} characters)`);
           return res.json({
@@ -1197,6 +1484,177 @@ export async function registerRoutes(
   });
 
   /**
+   * Mindmap generation endpoint using AI
+   * POST /api/ai/mindmap
+   * Body: { "transcript": "...", "mode": "gpu" | "api" }
+   * Returns: { "mindmap": "mermaid syntax string" }
+   */
+  app.post("/api/ai/mindmap", async (req: Request, res: Response) => {
+    try {
+      const { transcript, flashcards, mode } = req.body as { transcript?: string; flashcards?: any[]; mode?: "gpu" | "api" };
+
+      if (!transcript && !flashcards) {
+        return res.status(400).json({ error: "Transcript or flashcards are required" });
+      }
+
+      console.log(`[API] Generating mind map using Flashcards or Transcript...`);
+      const geminiApiKey = process.env.GEMINI_API_KEY;
+
+      if (geminiApiKey && mode !== "gpu") {
+        try {
+          const genAI = new GoogleGenerativeAI(geminiApiKey);
+
+          let contentSource = "";
+          let hasArabic = false;
+
+          if (flashcards && flashcards.length > 0) {
+            const flashcardsText = JSON.stringify(flashcards);
+            contentSource = `FLASHCARDS JSON DATA:\n${flashcardsText}\n\n`;
+            hasArabic = /[\u0600-\u06FF]/.test(flashcardsText);
+          } else {
+            contentSource = `Transcript fragment:\n${transcript!.substring(0, 15000)}\n\n`;
+            hasArabic = /[\u0600-\u06FF]/.test(transcript || "");
+          }
+
+          const targetLanguage = hasArabic ? "Arabic" : "English";
+
+          const mindmapPrompt = `You are an expert pedagogical designer. Create a Concept Map data structure based strictly on the provided source material (which contains Flashcards or a Transcript).
+
+CRITICAL RULES:
+1. OUTPUT FORMAT: You MUST return a SINGLE valid JSON object ONLY. No markdown highlighting like \`\`\`json. The JSON must have exactly three keys: "nodes", "edges", and "interactiveGuide".
+2. "nodes": An array of objects. Each object MUST have:
+   - "id": A unique string ID (e.g. "1", "2").
+   - "label": The purely theoretical concept text. Keep it concise. Focus on the core concepts presented in the flashcards (if provided).
+3. "edges": An array of objects representing the arrows. Each object MUST have:
+   - "id": A unique string ID (e.g. "e1-2").
+   - "source": The ID of the parent node.
+   - "target": The ID of the child node.
+   - "label": (Optional) The verb or relationship phrase written ON the arrow (e.g. "يؤدي إلى", "يعتمد على" in Arabic, or "leads to" in English).
+4. Identify the PRIMARY language from the source text. ALL output MUST be in that exact primary language.
+5. NO FORMULAS OR NUMBERS. Extract ONLY pure qualitative theoretical concepts.
+6. "interactiveGuide": An array of objects. Each MUST have "node" (name of the concept) and "explanation" (contextual academic explanation based on the flashcard definitions).
+
+Ensure the graph flows logically. If flashcards are provided, map out the connections between the terms defined in them.
+
+Source Material:
+${contentSource}
+`;
+
+          let aiResponse = await callGeminiWithRetry(genAI, mindmapPrompt, "gemini-2.0-flash", 3, 0.3, "application/json");
+
+          let finalPayload = aiResponse;
+          try {
+            // Attempt to clean any potential markdown and parse JSON
+            const cleanJson = aiResponse.replace(/```json/gi, "").replace(/```/g, "").trim();
+            const parsed = JSON.parse(cleanJson);
+
+            // Structure enforcing
+            if (!parsed.nodes) parsed.nodes = [];
+            if (!parsed.edges) parsed.edges = [];
+            if (!parsed.interactiveGuide) parsed.interactiveGuide = [];
+
+            finalPayload = JSON.stringify(parsed);
+          } catch (e) {
+            console.error("[API] Mindmap AI response was not valid JSON, applying fallback:", e);
+            finalPayload = JSON.stringify({
+              nodes: [{ id: "1", label: "Failed to parse map" }],
+              edges: [],
+              interactiveGuide: []
+            });
+          }
+
+          console.log(`[API] Generated Mindmap payload (${finalPayload.length} chars)`);
+          return res.json({ mindmap: finalPayload });
+        } catch (error: any) {
+          console.error("[API] Failed to generate mind map via Gemini:", error);
+        }
+      }
+
+      // Fallback simple mindmap
+      return res.json({ mindmap: "mindmap\n  Root\n    Topic 1\n    Topic 2" });
+    } catch (error: any) {
+      console.error("[API] Error in mindmap endpoint:", error);
+    }
+  });
+
+  /**
+   * Image analysis endpoint using Gemini Vision
+   * POST /api/ai/analyze-image
+   * Body: { "imageUrl": "...", "transcript": "..." }
+   * Returns: { "description": "..." }
+   */
+  app.post("/api/ai/analyze-image", async (req: Request, res: Response) => {
+    try {
+      const { imageUrl, transcript } = req.body;
+      if (!imageUrl) {
+        return res.status(400).json({ error: "Image URL is required" });
+      }
+
+      console.log(`[API] Analyzing image: ${imageUrl}`);
+      const geminiApiKey = process.env.GEMINI_API_KEY;
+
+      if (!geminiApiKey) {
+        return res.status(500).json({ error: "Gemini API key not configured" });
+      }
+
+      // We need to get the image buffer
+      let imageBuffer: Buffer;
+      let mimeType = "image/jpeg";
+
+      try {
+        if (imageUrl.startsWith("http")) {
+          const imgRes = await fetch(imageUrl);
+          if (!imgRes.ok) throw new Error("Failed to fetch image");
+          const arrayBuffer = await imgRes.arrayBuffer();
+          imageBuffer = Buffer.from(arrayBuffer);
+          mimeType = imgRes.headers.get("content-type") || "image/jpeg";
+        } else if (imageUrl.startsWith("/uploads/")) {
+          const localPath = path.join(process.cwd(), imageUrl);
+          imageBuffer = readFileSync(localPath);
+          mimeType = imageUrl.endsWith(".png") ? "image/png" : "image/jpeg";
+        } else {
+          throw new Error("Invalid image URL format");
+        }
+      } catch (e: any) {
+        console.error("[API] Failed to get image for analysis:", e);
+        return res.status(400).json({ error: "Could not access image for analysis" });
+      }
+
+      const genAI = new GoogleGenerativeAI(geminiApiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+      const hasArabic = /[\u0600-\u06FF]/.test(transcript || "");
+      const outputLanguage = hasArabic ? "Arabic" : "English";
+
+      const prompt = `Act as an expert academic assistant. Analyze this image in detail.
+While this image was extracted from a lecture/presentation context, you should use your full AI knowledge base to accurately and comprehensively explain what is in it.
+
+Lecture context (for reference only, may not be relevant):
+${transcript ? transcript.substring(0, 500) : "No context provided."}
+
+Please provide a clear, concise, and academic explanation of the concepts, diagrams, charts, or text shown in this image. Do not hallucinate based on the context if the image shows something else.
+Ensure your response is ONLY in ${outputLanguage} and formatted neatly as a description.`;
+
+      const result = await model.generateContent([
+        prompt,
+        {
+          inlineData: {
+            data: imageBuffer.toString("base64"),
+            mimeType: mimeType
+          }
+        }
+      ]);
+
+      const description = result.response.text().trim();
+      res.json({ description });
+
+    } catch (error: any) {
+      console.error("[API] Error analyzing image:", error);
+      res.status(500).json({ error: error.message || "Failed to analyze image" });
+    }
+  });
+
+  /**
    * Category classification endpoint using AI
    * POST /api/ai/category
    * Body: { "title": "...", "transcript": "...", "summary": "...", "mode": "gpu" | "api" }
@@ -1212,7 +1670,7 @@ export async function registerRoutes(
       };
 
       const isGpuMode = mode === "gpu";
-      console.log(`[API] Category endpoint hit with mode: ${mode}`);
+      console.log(`[API] Category endpoint hit with mode: ${mode} `);
 
       if (!title && !transcript && !summary) {
         return res.status(400).json({
@@ -1229,7 +1687,7 @@ export async function registerRoutes(
         .join("\n\n")
         .substring(0, 10000); // Limit content length
 
-      console.log(`[API] Classifying lecture category (${content.length} characters)`);
+      console.log(`[API] Classifying lecture category(${content.length} characters)`);
 
       const categories = [
         "science",
@@ -1269,43 +1727,44 @@ export async function registerRoutes(
           const genAI = new GoogleGenerativeAI(geminiApiKey);
           const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-          const prompt = `You are an expert content classifier. Analyze the following lecture content and classify it into ONE of these categories:
+          const prompt = `You are an expert content classifier.Analyze the following lecture content and classify it into ONE of these categories:
 
-Categories:
+          Categories:
 ${categories
               .map(
                 (cat) =>
                   `- ${cat}: ${categoryDescriptions[cat]}`,
               )
-              .join("\n")}
+              .join("\n")
+            }
 
 CRITICAL REQUIREMENTS:
-- The content is in ${language}. Respond in ${language} if needed, but the category name must be in English (one of: ${categories.join(", ")}).
+          - The content is in ${language}.Respond in ${language} if needed, but the category name must be in English(one of: ${categories.join(", ")}).
 - Analyze the MAIN TOPIC and PRIMARY FOCUS of the content, not just keywords that appear.
 - Be precise: Only classify as "technology" if the content is primarily about computer science, programming, or technical IT topics.
-- If the content mentions technology but is about another subject (e.g., "How AI is used in medicine" → medicine, not technology), classify by the MAIN subject.
-- Return ONLY the category name (one word) in lowercase, nothing else. No explanations, no additional text.
+- If the content mentions technology but is about another subject(e.g., "How AI is used in medicine" → medicine, not technology), classify by the MAIN subject.
+- Return ONLY the category name(one word) in lowercase, nothing else. No explanations, no additional text.
 - Examples:
-  - "Introduction to Quantum Mechanics" → science
-  - "Python Programming Tutorial" → technology
-  - "Calculus Basics" → mathematics
-  - "History of Ancient Rome" → history
-  - "How AI is Transforming Healthcare" → medicine (not technology)
-  - "Business Strategy for Startups" → business
-  - "Learning Spanish Grammar" → language
+          - "Introduction to Quantum Mechanics" → science
+            - "Python Programming Tutorial" → technology
+              - "Calculus Basics" → mathematics
+                - "History of Ancient Rome" → history
+                  - "How AI is Transforming Healthcare" → medicine(not technology)
+                    - "Business Strategy for Startups" → business
+                      - "Learning Spanish Grammar" → language
 
 Content to classify:
-Title: ${title || "N/A"}
-Summary: ${typeof summary === "string" ? summary.substring(0, 500) : Array.isArray(summary) ? (summary as string[]).join(" ").substring(0, 500) : "N/A"}
-Transcript (first 2000 chars): ${transcript?.substring(0, 2000) || "N/A"}
-
-Category:`;
-
-          const categoryPrompt = `You are an expert content classifier. Analyze the following and classify it into ONE of: ${categories.join(", ")}.
-          Return ONLY the single word for the category in lowercase.
           Title: ${title || "N/A"}
+          Summary: ${typeof summary === "string" ? summary.substring(0, 500) : Array.isArray(summary) ? (summary as string[]).join(" ").substring(0, 500) : "N/A"}
+          Transcript(first 2000 chars): ${transcript?.substring(0, 2000) || "N/A"}
+
+          Category: `;
+
+          const categoryPrompt = `You are an expert content classifier.Analyze the following and classify it into ONE of: ${categories.join(", ")}.
+          Return ONLY the single word for the category in lowercase.
+            Title: ${title || "N/A"}
           Content: ${transcript?.substring(0, 5000) || "N/A"}
-          Category:`;
+          Category: `;
 
           const aiResponse = await callGeminiWithRetry(genAI, categoryPrompt, "gemini-2.5-flash");
           const text = aiResponse.toLowerCase();
@@ -1328,7 +1787,7 @@ Category:`;
             // Try to find category as a whole word in the response
             for (const cat of categories) {
               // Check if category appears as a whole word (not part of another word)
-              const regex = new RegExp(`\\b${cat}\\b`, "i");
+              const regex = new RegExp(`\\b${cat} \\b`, "i");
               if (regex.test(cleanedText)) {
                 category = cat;
                 break;
@@ -1356,28 +1815,29 @@ Category:`;
         const ollamaModel = process.env.OLLAMA_MODEL || "qwen2.5:32b";
 
         try {
-          console.log(`[API] Using Ollama model for category classification: ${ollamaModel}`);
+          console.log(`[API] Using Ollama model for category classification: ${ollamaModel} `);
 
-          const prompt = `You are an expert content classifier. Analyze the following lecture content and classify it into ONE of these categories:
+          const prompt = `You are an expert content classifier.Analyze the following lecture content and classify it into ONE of these categories:
 
-Categories:
+  Categories:
 ${categories
               .map(
                 (cat) =>
                   `- ${cat}: ${categoryDescriptions[cat]}`,
               )
-              .join("\n")}
+              .join("\n")
+            }
 
-Analyze the content and return ONLY the category name (one word) in lowercase.
+Analyze the content and return ONLY the category name(one word) in lowercase.
 
-Content:
-Title: ${title || "N/A"}
-Summary: ${typeof summary === "string" ? summary.substring(0, 500) : Array.isArray(summary) ? (summary as string[]).join(" ").substring(0, 500) : "N/A"}
-Transcript: ${transcript?.substring(0, 2000) || "N/A"}
+    Content:
+  Title: ${title || "N/A"}
+  Summary: ${typeof summary === "string" ? summary.substring(0, 500) : Array.isArray(summary) ? (summary as string[]).join(" ").substring(0, 500) : "N/A"}
+  Transcript: ${transcript?.substring(0, 2000) || "N/A"}
 
-Category:`;
+  Category: `;
 
-          const ollamaResponse = await fetch(`${ollamaUrl}/api/generate`, {
+          const ollamaResponse = await fetch(`${ollamaUrl} /api/generate`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1404,7 +1864,7 @@ Category:`;
               }
             }
 
-            console.log(`[API] Ollama classified as: ${category}`);
+            console.log(`[API] Ollama classified as: ${category} `);
             return res.json({ category });
           }
         } catch (error: any) {
@@ -1438,7 +1898,7 @@ Category:`;
         });
       }
 
-      console.log(`[API] Generating quiz (${mode}) for transcript (${transcript?.length || 0} chars). Title: ${title}`);
+      console.log(`[API] Generating quiz(${mode}) for transcript(${transcript?.length || 0} chars).Title: ${title} `);
 
       const geminiApiKey = process.env.GEMINI_API_KEY;
       if (!geminiApiKey) {
@@ -1468,85 +1928,87 @@ Category:`;
       DIFFICULTY LEVEL: ${promptInstructions}
 
       CRITICAL INSTRUCTIONS:
-      1. Source Material Strategy:
-         - 70-80% of questions MUST be directly from the transcript (Source: "uploaded_content").
-         - 20-30% of questions MUST be based on general knowledge related to the topic "${title}", testing broader understanding beyond the specific video content (Source: "related_topic").
-         - For 'expert' mode, increase general knowledge questions to 40-50%.
-      2. Question Count: Generate exactly 20 questions (to ensure high quality and complete response).
+1. Source Material Strategy:
+- 70 - 80 % of questions MUST be directly from the transcript(Source: "uploaded_content").
+         - 20 - 30 % of questions MUST be based on general knowledge related to the topic "${title}", testing broader understanding beyond the specific video content(Source: "related_topic").
+         - For 'expert' mode, increase general knowledge questions to 40 - 50 %.
+      2. Question Count: Generate exactly 20 questions(to ensure high quality and complete response).
       3. Distribution:
-         - 10 Multiple Choice Questions
-         - 7 True/False Questions
-         - 3 Open-Ended/Essay Questions
-      4. Content Logic:
-         - If the topic involves Mathematics, Engineering, or Physics:
-           * Essay questions MUST be numerical problems/exercises.
+- 10 Multiple Choice Questions
+  - 7 True / False Questions
+    - 3 Open - Ended / Essay Questions
+4. Content Logic:
+- If the topic involves Mathematics, Engineering, or Physics:
+           * Essay questions MUST be numerical problems / exercises.
            * Multiple Choice questions MUST include numerical problems.
            * Purely theoretical questions in Multiple Choice should be minimized.
          - For other topics, focus on key concepts and understanding.
       5. Ordering & Variety:
-         - SHUFFLE the questions in the final JSON array.
-         - Do NOT group questions by type (e.g. do NOT put all MCQs first).
-         - Do NOT group by source (e.g. do NOT put all video questions first).
-         - Mix Easy, Medium, and Hard questions randomly (adhering to the difficulty mode).
+- SHUFFLE the questions in the final JSON array.
+         - Do NOT group questions by type(e.g.do NOT put all MCQs first).
+         - Do NOT group by source(e.g.do NOT put all video questions first).
+         - Mix Easy, Medium, and Hard questions randomly(adhering to the difficulty mode).
       6. Essay Questions:
-         - Must include "expected_keywords" (array of strings) that would appear in a correct answer.
-      6. Language: Detect and respond in the SAME language as the transcript (${language}).
+- Must include "expected_keywords"(array of strings) that would appear in a correct answer.
+         - IF the question is a Mathematical, Physics, or Engineering numerical problem, the "expected_keywords" MUST ONLY contain the final numerical answer(s) to be computed, NO TEXTual words(e.g., ["9.8", "-4.5", "10"]).
+         - IF it is a theoretical / descriptive question, "expected_keywords" should contain the core conceptual words expected.
+      7. Language: Detect and respond in the SAME language as the transcript(${language}).
       7. References: For EACH question, you MUST provide a "reference" object:
-         - "concept": The specific concept being tested (e.g., "Polymorphism").
+- "concept": The specific concept being tested(e.g., "Polymorphism").
          - "location": 
-            * If "source_type" is "uploaded_content": Provide the approximate timestamp (e.g., "05:20").
-            * If "source_type" is "related_topic": You MUST provide a specific, real-world citation. Example: "Book: 'Clean Code' by Robert C. Martin, Ch. 2" or "Website: 'MDN Web Docs - Array Methods'". Do NOT use generic terms like "General Knowledge".
-         - "source_type": Use "uploaded_content" if the info is present in the transcript. Use "related_topic" if you used outside knowledge.
+            * If "source_type" is "uploaded_content": Provide the approximate timestamp(e.g., "05:20").
+            * If "source_type" is "related_topic": You MUST provide a specific, real - world citation.Example: "Book: 'Clean Code' by Robert C. Martin, Ch. 2" or "Website: 'MDN Web Docs - Array Methods'".Do NOT use generic terms like "General Knowledge".
+         - "source_type": Use "uploaded_content" if the info is present in the transcript.Use "related_topic" if you used outside knowledge.
 
-      Format: Return ONLY valid JSON with this EXACT structure (pay attention to "type" field):
-      {
-        "questions": [
-          {
-            "id": 1,
-            "text": "Question text...",
-            "options": ["Option A", "Option B", "Option C", "Option D"],
-            "correct_answer": "Option A",
-            "type": "multiple_choice",
-            "reference": {
-              "concept": "Core Concept (e.g. Variables)",
-              "location": "Approx timestamp (e.g. 05:30) or 'General Knowledge'",
-              "source_type": "uploaded_content" OR "external_knowledge"
+  Format: Return ONLY valid JSON with this EXACT structure(pay attention to "type" field):
+{
+  "questions": [
+    {
+      "id": 1,
+      "text": "Question text...",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correct_answer": "Option A",
+      "type": "multiple_choice",
+      "reference": {
+        "concept": "Core Concept (e.g. Variables)",
+        "location": "Approx timestamp (e.g. 05:30) or 'General Knowledge'",
+        "source_type": "uploaded_content" OR "external_knowledge"
             }
-          },
-          {
-            "id": 16,
-            "text": "True/False Statement...",
-            "options": ["True", "False"],
-            "correct_answer": "True",
-            "type": "true_false",
-            "reference": {
-              "concept": "Concept...",
-              "location": "Location...",
-              "source_type": "uploaded_content"
-            }
-          },
-          {
-            "id": 26,
-            "text": "Essay question text...",
-            "type": "open_ended",
-            "expected_keywords": ["keyword1", "keyword2"],
-            "reference": {
-              "concept": "Concept...",
-              "location": "Location...",
-              "source_type": "external_knowledge"
-            }
-          }
-        ]
+    },
+    {
+      "id": 16,
+      "text": "True/False Statement...",
+      "options": ["True", "False"],
+      "correct_answer": "True",
+      "type": "true_false",
+      "reference": {
+        "concept": "Concept...",
+        "location": "Location...",
+        "source_type": "uploaded_content"
       }
-      IMPORTANT: Ensure "true_false" questions have type "true_false" and options ["True", "False"] (or Arabic equivalents).
-      Transcript: ${(transcript || "").substring(0, 20000)}`;
+    },
+    {
+      "id": 26,
+      "text": "Essay question text...",
+      "type": "open_ended",
+      "expected_keywords": ["keyword1", "keyword2"],
+      "reference": {
+        "concept": "Concept...",
+        "location": "Location...",
+        "source_type": "external_knowledge"
+      }
+    }
+  ]
+}
+IMPORTANT: Ensure "true_false" questions have type "true_false" and options["True", "False"](or Arabic equivalents).
+  Transcript: ${(transcript || "").substring(0, 20000)} `;
 
       // Enable retries (3) to allow fallback to other models
-      const aiResponse = await callGeminiWithRetry(genAI, quizPrompt, "gemini-2.5-flash", 3);
+      const aiResponse = await callGeminiWithRetry(genAI, quizPrompt, "gemini-2.5-flash", 3, undefined, "application/json");
 
       let parsedResponse;
       try {
-        const cleanedResponse = aiResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+        const cleanedResponse = aiResponse.replace(/```json\n ? /g, "").replace(/```\n?/g, "").trim();
         parsedResponse = JSON.parse(cleanedResponse);
       } catch (parseError) {
         console.error("[API] Failed to parse JSON from Gemini quiz response:", parseError);
@@ -1557,6 +2019,69 @@ Category:`;
     } catch (error: any) {
       console.error("[API] Error generating quiz:", error);
       res.status(500).json({ error: "Failed to generate quiz questions" });
+    }
+  });
+
+  /**
+   * Evaluate Essay Answer endpoint
+   * POST /api/ai/evaluate-answer
+   */
+  app.post("/api/ai/evaluate-answer", async (req: Request, res: Response) => {
+    try {
+      const { question, userAnswer, correctAnswer, expectedKeywords = [] } = req.body;
+
+      if (!question || !userAnswer) {
+        return res.status(400).json({ error: "Missing required fields" });
+      }
+
+      const geminiApiKey = process.env.GEMINI_API_KEY;
+      if (!geminiApiKey) {
+        return res.status(500).json({ error: "Gemini API key is not configured" });
+      }
+
+      const genAI = new GoogleGenerativeAI(geminiApiKey);
+      const isArabic = /[\u0600-\u06FF]/.test(userAnswer + question);
+      const languageText = isArabic ? "Arabic" : "English";
+
+      const prompt = `You are an expert examiner.Evaluate the student's answer to the given question.
+
+Question: "${question}"
+      Reference Correct Answer / Context: "${correctAnswer || 'N/A'}"
+      Expected Keywords: ${expectedKeywords.join(', ') || 'None'}
+      Student's Answer: "${userAnswer}"
+
+      CRITICAL RULE FOR NUMERICAL / MATH QUESTIONS:
+      If the \`Expected Keywords\` represent a Numerical Answer (e.g., numbers, formulas, equations) or the question is a math/physics problem requiring a calculated result:
+      - STRICT EVALUATION: The student's answer is either completely correct (100%) or completely wrong (0%) based purely on whether their final number/expression is mathematically equivalent to the expected keyword(s). 
+      - Do NOT give partial credit (e.g., 60%) for just having a "close" number. It is 100% or 0%.
+      - If it is correct, similarityScore MUST be 100, isCorrect MUST be true.
+      - If it is incorrect, similarityScore MUST be 0, isCorrect MUST be false.
+      - ONLY use similarityScore between 1 and 99 for partial marking in theoretical/essay (text) questions!
+
+      Provide your evaluation in JSON format exactly like this:
+      {
+        "similarityScore": <number between 0 and 100 representing how close the student's answer is to the correct concepts>,
+        "isCorrect": <boolean: true if similarityScore is >= 60, false otherwise. AND for math, it must be strict.>,
+        "feedback": "<string: In ${languageText}, tell the user why they are correct or incorrect.>",
+        "correctAnswer": "<string: In ${languageText}, provide a very short and brief correct answer. If the student is correct, just write the core answer without extra details.>"
+      }
+      
+      Do NOT include markdown block markers like \`\`\`json. Return only raw JSON.`;
+
+      const aiResponse = await callGeminiWithRetry(genAI, prompt, "gemini-2.5-flash", 2);
+
+      let parsedResponse;
+      try {
+        const cleanedResponse = aiResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+        parsedResponse = JSON.parse(cleanedResponse);
+      } catch (e) {
+        return res.status(500).json({ error: "Failed to parse evaluation response" });
+      }
+
+      return res.json(parsedResponse);
+    } catch (error: any) {
+      console.error("[API] Error evaluating answer:", error);
+      res.status(500).json({ error: "Failed to evaluate answer" });
     }
   });
 
@@ -1588,8 +2113,9 @@ Category:`;
           console.log("[API] Using Gemini API for flashcards generation");
           const genAI = new GoogleGenerativeAI(geminiApiKey);
           const flashcardPrompt = `Create 10-15 study flashcards in JSON format: { "flashcards": [{ "id": 1, "term": "...", "definition": "..." }] }. Use the same language as transcript.
+          CRITICAL: If the transcript contains mathematical formulas, laws, or equations, you MUST preserve them using standard LaTeX format (e.g., $inline$ or $$block$$) in both the term and definition.
           Transcript: ${transcript.substring(0, 20000)}`;
-          const aiResponse = await callGeminiWithRetry(genAI, flashcardPrompt, "gemini-2.5-flash");
+          const aiResponse = await callGeminiWithRetry(genAI, flashcardPrompt, "gemini-2.5-flash", 3, undefined, "application/json");
 
           if (aiResponse) {
             // Parse JSON from response (remove markdown code blocks if present)
@@ -1650,6 +2176,7 @@ CRITICAL REQUIREMENTS:
 - Generate flashcards for key concepts, important terms, definitions, formulas, dates, names, or significant facts.
 - Each flashcard should have a clear, concise term (front) and a detailed, informative definition (back).
 - Focus on the most important and memorable information that would help students master the material.
+- CRITICAL: If the transcript contains mathematical formulas, laws, or equations, you MUST preserve them using standard LaTeX format (e.g., $inline$ or $$block$$) in both the term and definition.
 - Return ONLY valid JSON in this exact format (no markdown, no code blocks, no extra text):
 {
   "flashcards": [
@@ -1755,6 +2282,199 @@ Generate the flashcards as JSON:`,
   });
 
   /**
+   * AI Formulas endpoint
+   * POST /api/ai/formulas
+   * Body: { "transcript": "...", "mode": "api" | "gpu" }
+   */
+  app.post("/api/ai/formulas", async (req: Request, res: Response) => {
+    try {
+      const { transcript, mode, geminiFileUri, geminiFileMimeType } = req.body as { transcript?: string; mode?: "gpu" | "api"; geminiFileUri?: string; geminiFileMimeType?: string; };
+
+      const isGpuMode = mode === "gpu";
+
+      if (!transcript || typeof transcript !== "string" || transcript.trim().length < 200) {
+        return res.status(400).json({
+          error: "Transcript is too short to generate formulas (minimum 200 characters)",
+        });
+      }
+
+      console.log(`[API] Extracting formulas from transcript (${transcript.length} characters)`);
+
+      const hasArabic = /[\u0600-\u06FF]/.test(transcript);
+      const languageText = hasArabic ? "Arabic" : "English";
+
+      const prompt = `You are a strict data science and engineering professor.
+Your ONLY task is to return a JSON array of mathematical formulas, equations, statistical rules, or laws found in the transcript.
+
+CRITICAL REQUIREMENTS:
+- **STRICT ENFORCEMENT:** You MUST ONLY extract formulas if the transcript EXPLICITLY contains mathematical concepts, physics formulas, algorithms, or numeric logic.
+- **DO NOT HALLUCINATE OR INVENT:** If the transcript is about history, psychology, general conversational topics, or does NOT contain significant mathematical/scientific numbers, you MUST return an empty array: \`{ "formulas": [] }\`. THIS IS A STRICT RULE. Do not force the creation of fake formulas.
+- Write ALL names and descriptions in ${languageText}. (Keep LaTeX formulas in standard mathematical notation).
+- Format: \`{ "formulas": [ { "id": 1, "name": "...", "formula": "c = \\sqrt{a^2+b^2}", "description": "...", "category": "Statistics" } ] }\`
+- Categories: Algebra, Calculus, Geometry, Trigonometry, Statistics, Physics, Chemistry, Machine Learning, Computer Science, Other.
+- In "description", you MUST wrap all inline variables, numbers, or short expressions in $...$ (e.g., $x$, $P(y=0)$).
+- NEVER use double quotes (") inside strings. Use single quotes.
+
+Return ONLY valid JSON in this exact structure (no markdown borders, no code blocks, just raw JSON):
+{
+  "formulas": [
+    {
+      "id": 1,
+      "name": "formula name",
+      "formula": "latex representation",
+      "description": "detailed description of the formula and its variables",
+      "category": "category name"
+    }
+  ]
+}
+
+Transcript for Analysis:
+${transcript.substring(0, 25000)}`;
+
+      // Priority 1: Gemini API
+      const geminiApiKey = process.env.GEMINI_API_KEY;
+
+      if (geminiApiKey && !isGpuMode) {
+        try {
+          console.log("[API] Using Gemini API for formulas extraction");
+          // Non-null assertion on geminiApiKey to fix TS error since we checked it above
+          const genAI = new GoogleGenerativeAI(geminiApiKey!);
+
+          let apiPrompt: string | any[] = prompt;
+          if (geminiFileUri && geminiFileMimeType) {
+            console.log(`[API] Using Vision API with file ${geminiFileUri} for formula extraction.`);
+            apiPrompt = [
+              prompt,
+              {
+                fileData: {
+                  fileUri: geminiFileUri,
+                  mimeType: geminiFileMimeType,
+                },
+              },
+            ];
+          }
+
+          const aiResponse = await callGeminiWithRetry(genAI, apiPrompt, "gemini-2.5-flash", 3, 0.1, "application/json");
+
+          if (aiResponse) {
+            let parsedResponse: { formulas?: any[] } = { formulas: [] };
+            let cleanedResponse = aiResponse
+              .replace(/```json\n?/gi, "")
+              .replace(/```\n?/g, "")
+              .trim();
+
+            // Try to extract just the JSON part in case the model added conversational text
+            const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              cleanedResponse = jsonMatch[0];
+            }
+
+            try {
+              // Fix unescaped backslashes before non-standard JSON escape characters (crucial for LaTeX)
+              const strictCleaned = cleanedResponse.replace(/\\([^"\\/bfnrtu])/g, '\\\\$1');
+              parsedResponse = JSON.parse(strictCleaned);
+            } catch (parseError) {
+              console.warn("[API] Failed to parse JSON from Gemini formulas response, using Regex fallback");
+
+              const formulasFallback: any[] = [];
+              const formulaBlocks = cleanedResponse.split(/\{\s*"id"|\{\s*"name"/).slice(1);
+
+              for (let i = 0; i < formulaBlocks.length; i++) {
+                const block = formulaBlocks[i];
+                const nameMatch = block.match(/"name"\s*:\s*"([^"]*)"/);
+                const formulaMatch = block.match(/"formula"\s*:\s*"([^"]*)"/);
+                const descMatch = block.match(/"description"\s*:\s*"([^"]*)"/);
+                const catMatch = block.match(/"category"\s*:\s*"([^"]*)"/);
+
+                if (nameMatch && formulaMatch) {
+                  formulasFallback.push({
+                    id: i + 1,
+                    name: nameMatch[1],
+                    formula: formulaMatch[1].replace(/\\\\/g, "\\"),
+                    description: descMatch ? descMatch[1] : "",
+                    category: (catMatch ? catMatch[1] : "Other")
+                  });
+                }
+              }
+
+              if (formulasFallback.length > 0) {
+                parsedResponse = { formulas: formulasFallback };
+              }
+            }
+
+            if (parsedResponse.formulas && Array.isArray(parsedResponse.formulas)) {
+              console.log(`[API] Gemini formulas extraction found ${parsedResponse.formulas.length} formulas`);
+              return res.json({ formulas: parsedResponse.formulas });
+            }
+          }
+        } catch (geminiError: any) {
+          console.error("[API] Gemini API error for formulas:", geminiError);
+        }
+      }
+
+      // Priority 2: Ollama (GPU mode)
+      if (isGpuMode) {
+        const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434";
+        const ollamaModel = process.env.OLLAMA_MODEL || "qwen2.5:32b";
+
+        try {
+          console.log(`[API] Using Ollama model for formulas: ${ollamaModel}`);
+          const ollamaResponse = await fetch(`${ollamaUrl}/api/generate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: ollamaModel,
+              prompt: prompt,
+              stream: false,
+              options: { temperature: 0.1, top_p: 0.9, top_k: 40 },
+            }),
+          });
+
+          if (ollamaResponse.ok) {
+            const ollamaData = await ollamaResponse.json();
+            const aiResponse: string = (ollamaData.response || "").trim();
+
+            if (aiResponse) {
+              try {
+                let cleanedResponse = aiResponse
+                  .replace(/```json\n?/gi, "")
+                  .replace(/```\n?/g, "")
+                  .trim();
+
+                const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                  cleanedResponse = jsonMatch[0];
+                }
+
+                // Fix unescaped backslashes before non-standard JSON escape characters (crucial for LaTeX)
+                cleanedResponse = cleanedResponse.replace(/\\([^"\\/bfnrtu\n\r])/g, '\\\\$1');
+
+                const parsedResponse = JSON.parse(cleanedResponse);
+
+                if (parsedResponse.formulas && Array.isArray(parsedResponse.formulas)) {
+                  console.log(`[API] Ollama formulas generated with ${parsedResponse.formulas.length} formulas`);
+                  return res.json({ formulas: parsedResponse.formulas });
+                }
+              } catch (parseError) {
+                console.warn("[API] Failed to parse JSON from Ollama formulas response. Raw output:", aiResponse);
+              }
+            }
+          }
+        } catch (ollamaError) {
+          console.error("[API] Ollama formulas extraction error:", ollamaError);
+        }
+      }
+
+      // Fallback: Return empty formulas array (graceful degradation)
+      console.log("[API] No formulas could be extracted or generated");
+      return res.json({ formulas: [] });
+    } catch (error: any) {
+      console.error("[API] Error generating formulas:", error);
+      res.status(500).json({ error: "Failed to generate formulas" });
+    }
+  });
+
+  /**
    * Text summarization endpoint using Gemini API
    * POST /api/summarize
    */
@@ -1789,23 +2509,51 @@ Text to summarize:
 ${text.substring(0, 30000)}`;
 
       const summarizePrompt = `Summarize this text in 3 sections: introduction, summary, keypoints.
-      Return ONLY valid JSON: { "introduction": "...", "summary": "...", "keypoints": ["...", "..."] }.
-      Language: Match input.
-      Text: ${text.substring(0, 25000)}`;
+Return ONLY valid JSON: { "introduction": "...", "summary": "...", "keypoints": ["...", "..."] }.
+Language: Match input.
+Text: ${text.substring(0, 25000)}`;
 
       const aiResponse = await callGeminiWithRetry(genAI, summarizePrompt, "gemini-2.5-flash");
 
       let parsedResponse;
+      let cleanedResponse = aiResponse.replace(/```json\n?/gi, "").replace(/```\n?/g, "").trim();
+      const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanedResponse = jsonMatch[0];
+      }
+
       try {
-        const cleanedResponse = aiResponse.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-        parsedResponse = JSON.parse(cleanedResponse);
+        // Remove invalid escapes
+        const strictCleaned = cleanedResponse.replace(/\\([^"\\/bfnrtu])/g, '$1');
+        parsedResponse = JSON.parse(strictCleaned);
       } catch (e) {
-        // Simple extraction fallback
-        parsedResponse = {
-          introduction: "Failed to parse detailed structure",
-          summary: aiResponse,
-          keyPoints: []
+        console.warn("[API] Failed to parse /api/summarize JSON, using regex fallback");
+
+        const extractField = (fieldName: string) => {
+          const match = cleanedResponse.match(new RegExp(`"${fieldName}"\\s*:\\s*(?:\\[(.*?)\\]|"([^"]*)")`, "is"));
+          if (match) {
+            if (match[1] !== undefined) {
+              const arrMatch = match[1].match(/"([^"]*)"/g);
+              return arrMatch ? arrMatch.map((s: string) => s.replace(/^"|"$/g, "").replace(/\\n/g, "\n")) : [];
+            }
+            return match[2] !== undefined ? match[2].replace(/\\n/g, "\n") : null;
+          }
+          return null;
         };
+
+        const intro = extractField("introduction");
+        const summ = extractField("summary");
+        const kp = extractField("keypoints");
+
+        if (!intro && !summ && (!kp || kp.length === 0)) {
+          parsedResponse = { introduction: "", summary: cleanedResponse, keypoints: [] };
+        } else {
+          parsedResponse = {
+            introduction: typeof intro === "string" ? intro : "",
+            summary: typeof summ === "string" ? summ : "",
+            keypoints: Array.isArray(kp) ? kp : []
+          };
+        }
       }
 
       return res.json({
@@ -1862,7 +2610,7 @@ ${text.substring(0, 30000)}`;
 مهم جداً: JSON فقط. بدون markdown، بدون شرح.
 
 التنسيق:
-{"lectureTitle":"عنوان","slides":[{"title":"عنوان 1","bullets":["نقطة 1","نقطة 2","نقطة 3"]},{"title":"عنوان 2","bullets":["نقطة 1","نقطة 2"]}]}
+{ "lectureTitle": "عنوان", "slides": [{ "title": "عنوان 1", "bullets": ["نقطة 1", "نقطة 2", "نقطة 3"] }, { "title": "عنوان 2", "bullets": ["نقطة 1", "نقطة 2"] }] }
 
 المتطلبات:
 - 8-12 شريحة
@@ -1897,7 +2645,7 @@ Quality Guidelines:
 1. Each slide: Clear title + 3-6 information-rich points
 2. Titles: Descriptive and specific (e.g., "Core Concepts", "Practical Applications")
 3. Bullets: Detailed and comprehensive (one or two sentences each)
-4. Organization: Introduction → Concepts → Details → Examples → Applications → Conclusion
+4. Organization: Introduction -> Concepts -> Details -> Examples -> Applications -> Conclusion
 5. Coverage: Comprehensive coverage of all lecture aspects
 
 Lecture Transcript:
@@ -1931,7 +2679,7 @@ ${transcript.substring(0, 30000)}`;
 
               // Clean and parse JSON
               let cleanedResponse = aiResponseRaw
-                .replace(/```json/gi, "")
+                .replace(/```json\n?/gi, "")
                 .replace(/```/g, "")
                 .trim();
 
@@ -2043,11 +2791,10 @@ ${transcript.substring(0, 30000)}`;
 2. العناوين يجب أن تكون وصفية وتعبر عن محتوى الشريحة بوضوح.
 3. كل شريحة يجب أن تحتوي على 3-6 نقاط رئيسية كحد أقصى.
 4. النقاط يجب أن تكون مختصرة ولكنها مفيدة وغنية بالمعلومات.
-5. استخدم لغة تعليمية واضحة ومفهومة.
+5. هام جداً للرياضيات: لا تستخدم رموز LaTeX (مثل $...$ أو \\sqrt) مطلقاً في الشرائح. قم بتبسيط أو تحويل جميع المعادلات الرياضية إلى نص مقروء ومفهوم (مثال: اكتب "س تربيع" بدلاً من الوصف البرمجي، أو استخدم رموز عادية بسيطة). إذا كانت المعادلة معقدة، اشرح معناها بدلاً من كتابة الرموز المعقدة.
 6. نظم المحتوى منطقياً: مقدمة → المفاهيم الرئيسية → تفاصيل → أمثلة → تطبيقات → خاتمة.
 7. تأكد من أن كل شريحة لها عنوان واضح وليس "شريحة 1" أو "عنوان" فقط.
-8. استخدم عناوين وصفية مثل "مقدمة في الموضوع" أو "المفاهيم الأساسية" أو "التطبيقات العملية".
-9. لا تترك أي شريحة بدون عنوان أو بدون نقاط.
+8. لا تترك أي شريحة بدون عنوان أو بدون نقاط.
 
 نص المحاضرة:
 ${transcript.substring(0, 30000)}`
@@ -2077,7 +2824,7 @@ Guidelines:
 - Each slide MUST have a clear and descriptive title.
 - Each slide should have 3-6 bullet points maximum.
 - Bullets should be concise but informative.
-- Use clear, educational language.
+- CRITICAL FOR MATH: DO NOT use raw LaTeX (like $...$ or \\sqrt). Convert all mathematical formulas into plain, readable text (e.g. "x squared" or simple unicode like x²). If a formula is too complex, explain its meaning conceptually instead of writing raw code.
 - Organize content logically (introduction → main concepts → examples → conclusion).
 - Ensure every slide has a meaningful title, never leave titles empty.
 
